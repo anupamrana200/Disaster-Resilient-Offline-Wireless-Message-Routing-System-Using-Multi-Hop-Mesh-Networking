@@ -1,0 +1,73 @@
+# Learn more https://docs.github.com/en/get-started/getting-started-with-git/ignoring-files
+
+# ─── Dependencies ─────────────────────────────────────────────────────────────
+node_modules/
+
+# ─── Expo ─────────────────────────────────────────────────────────────────────
+.expo/
+dist/
+web-build/
+expo-env.d.ts
+
+# ─── Android Build Artifacts ──────────────────────────────────────────────────
+# These are generated on every build — large, machine-specific, not source code
+android/.gradle/
+android/.kotlin/
+android/build/
+android/app/build/
+android/app/.cxx/
+android/local.properties
+
+# ─── Build Outputs ────────────────────────────────────────────────────────────
+*.apk
+*.aab
+*.ipa
+
+# ─── Native / Signing Credentials ─────────────────────────────────────────────
+# NEVER commit signing keys or certificates
+*.orig.*
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+*.keystore
+
+# ─── Metro Bundler ────────────────────────────────────────────────────────────
+.metro-health-check*
+
+# ─── Logs & Temporary Debug Files ─────────────────────────────────────────────
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+*.log
+build_*.txt
+cmake_error.txt
+expo_run.txt
+build_output.txt
+
+# ─── Environment / Secrets ────────────────────────────────────────────────────
+# .env files contain API keys and secrets — never push these
+.env*
+
+# ─── macOS ────────────────────────────────────────────────────────────────────
+.DS_Store
+*.pem
+
+# ─── Windows ──────────────────────────────────────────────────────────────────
+Thumbs.db
+desktop.ini
+
+# ─── TypeScript ───────────────────────────────────────────────────────────────
+*.tsbuildinfo
+
+# ─── Test Coverage ────────────────────────────────────────────────────────────
+coverage/
+
+# ─── IDE / Editor ─────────────────────────────────────────────────────────────
+.cursor/
+.idea/
+*.iml
+
+# ─── AI Tools (local config) ──────────────────────────────────────────────────
+.claude/
