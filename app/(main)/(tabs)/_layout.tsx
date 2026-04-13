@@ -5,6 +5,7 @@
 
 import { Tabs } from 'expo-router';
 import { Text } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 function TabIcon({ icon, focused }: { icon: string; focused: boolean }) {
   return (
@@ -15,6 +16,11 @@ function TabIcon({ icon, focused }: { icon: string; focused: boolean }) {
 }
 
 export default function TabLayout() {
+  // bottom inset is 0 on gesture-nav phones (the system handles the gap)
+  // and equals the nav-bar height on 3-button-nav phones so the tab bar
+  // sits above the system navigation bar instead of behind it.
+  const { bottom } = useSafeAreaInsets();
+
   return (
     <Tabs
       screenOptions={{
@@ -23,8 +29,8 @@ export default function TabLayout() {
           backgroundColor: '#0d1117',
           borderTopColor: 'rgba(255,255,255,0.07)',
           borderTopWidth: 1,
-          height: 60,
-          paddingBottom: 8,
+          height: 60 + bottom,
+          paddingBottom: 8 + bottom,
           paddingTop: 4,
         },
         tabBarInactiveTintColor: 'rgba(255,255,255,0.35)',

@@ -66,11 +66,26 @@ export async function getMessages(): Promise<Message[]> {
   return readJSON<Message[]>(KEYS.MESSAGES, []);
 }
 
+/**
+ * Returns the 8-character short hex prefix of a message_id.
+ * Handles both full UUIDs ("460c8400-e29b-...") and already-truncated IDs ("460c8400").
+ */
+function shortId(id: string): string {
+  return id.replace(/-/g, '').slice(0, 8).toLowerCase();
+}
+
 /** Append a single message to the stored list. */
 export async function saveMessage(msg: Message): Promise<void> {
   const existing = await getMessages();
-  // Avoid re-storing duplicates
-  const alreadyExists = existing.some(m => m.message_id === msg.message_id);
+  // Dedup by BOTH exact ID AND 8-char short prefix.
+  // Relay messages arrive with a truncated message_id ("460c8400") while the
+  // original sent message has a full UUID ("460c8400-e29b-..."). Exact-match
+  // alone would let the relay through as a second entry. Short-prefix match
+  // catches this even when the IDs differ in length.
+  const msgShort = shortId(msg.message_id);
+  const alreadyExists = existing.some(m =>
+    m.message_id === msg.message_id || shortId(m.message_id) === msgShort,
+  );
   if (alreadyExists) return;
   await writeJSON(KEYS.MESSAGES, [...existing, msg]);
 }

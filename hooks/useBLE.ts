@@ -42,7 +42,7 @@ interface UseBLEResult {
 }
 
 export function useBLE(): UseBLEResult {
-  const { dispatch, upsertNode, setNodeConnected, setNodeDisconnected, setScanning } =
+  const { dispatch, upsertNode, setNodeConnected, setNodeDisconnected, setScanning, myNodeId } =
     useNodesSlice();
 
   const [isReady, setReady] = useState(false);
@@ -53,6 +53,12 @@ export function useBLE(): UseBLEResult {
   const isReadyRef = useRef(false);
   const isScanningRef = useRef(false);
   const scanListenerRef = useRef<any>(null);
+
+  // Always-fresh ref — never stale in closures.
+  // Used to filter out our own BLE advertisement chunks on Android 11,
+  // which reports the device's own broadcasts back via the scan listener.
+  const myNodeIdRef = useRef<string>('');
+  myNodeIdRef.current = myNodeId;
 
   // ─── Init: permissions + BT state ──────────────────────────────────────────
   useEffect(() => {
@@ -219,6 +225,25 @@ export function useBLE(): UseBLEResult {
                     hops: manufData[11] ?? 0,
                     payload: manufData.slice(12, 22),
                   };
+
+                  // ── Android 11 self-scan guard ─────────────────────────────
+                  // Android ≤11 (API 30) reports the device's own BLE
+                  // advertisements back to its own scan listener. Android 12+
+                  // does not. Without this check the sender would receive and
+                  // relay its own message, causing the receiver to see it twice.
+                  const myShort = myNodeIdRef.current.replace(/-/g, '').slice(0, 4);
+                  if (myShort && chunk.srcIdHex === myShort) {
+                    console.log(`[BLE] Dropping own chunk (self-scan) msg=${chunk.msgIdHex}`);
+                    return;
+                  }
+
+                  // ── Early seenMids filter ──────────────────────────────────
+                  // If PhoneMeshService already delivered or pre-marked this
+                  // message ID (e.g. outgoing message), discard before buffering.
+                  if (getPhoneMeshService().isMessageSeen(chunk.msgIdHex)) {
+                    return;
+                  }
+
                   console.log(`[BLE] Chunk ${chunk.chunkIndex + 1}/${chunk.totalChunks} from ${chunk.srcIdHex}`);
                   getPhoneMeshService().handleChunk(chunk);
                 }

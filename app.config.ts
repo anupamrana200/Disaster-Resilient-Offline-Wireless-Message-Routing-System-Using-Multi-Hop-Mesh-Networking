@@ -45,6 +45,13 @@ export default ({ config }: ConfigContext): ExpoConfig => {
     },
     plugins: [
       'expo-router',
+      [
+        'expo-notifications',
+        {
+          color: '#00c896',
+          defaultChannel: 'mesh-messages',
+        },
+      ],
       'expo-asset',
       [
         'react-native-ble-plx',

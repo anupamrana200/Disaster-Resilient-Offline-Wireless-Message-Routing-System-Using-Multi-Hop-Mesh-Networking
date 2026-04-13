@@ -16,6 +16,8 @@ import {
   Text,
   StyleSheet,
   SafeAreaView,
+  KeyboardAvoidingView,
+  Platform,
 } from 'react-native';
 import { LinearGradient } from 'expo-linear-gradient';
 import { useNodeId } from '@/hooks/useNodeId';
@@ -139,42 +141,48 @@ export default function ChatScreen() {
           pendingCount={pendingCount}
         />
 
-        {/* Message List */}
-        <FlatList
-          ref={listRef}
-          id="chat-message-list"
-          data={flatItems as any}
-          keyExtractor={(item: any) =>
-            item.type === 'separator' ? item.key : item.message_id
-          }
-          renderItem={({ item }: any) => {
-            if (item.type === 'separator') {
-              return (
-                <View style={styles.separatorRow}>
-                  <View style={styles.separatorLine} />
-                  <Text style={styles.separatorLabel}>{item.label}</Text>
-                  <View style={styles.separatorLine} />
-                </View>
-              );
+        {/* Message list + input — wrapped so the input stays visible above keyboard */}
+        <KeyboardAvoidingView
+          style={styles.keyboardView}
+          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+          keyboardVerticalOffset={0}
+        >
+          <FlatList
+            ref={listRef}
+            id="chat-message-list"
+            data={flatItems as any}
+            keyExtractor={(item: any) =>
+              item.type === 'separator' ? item.key : item.message_id
             }
-            const msg = item as Message;
-            const resolvedMsg = msg.source_id === deviceId
-              ? msg
-              : { ...msg, source_name: resolveSenderName(msg, nearbyNodes) };
-            return (
-              <MessageBubble message={resolvedMsg} isOwn={msg.source_id === deviceId} />
-            );
-          }}
-          ListEmptyComponent={renderEmpty}
-          contentContainerStyle={[
-            styles.listContent,
-            messages.length === 0 && styles.listContentEmpty,
-          ]}
-          showsVerticalScrollIndicator={false}
-        />
+            renderItem={({ item }: any) => {
+              if (item.type === 'separator') {
+                return (
+                  <View style={styles.separatorRow}>
+                    <View style={styles.separatorLine} />
+                    <Text style={styles.separatorLabel}>{item.label}</Text>
+                    <View style={styles.separatorLine} />
+                  </View>
+                );
+              }
+              const msg = item as Message;
+              const resolvedMsg = msg.source_id === deviceId
+                ? msg
+                : { ...msg, source_name: resolveSenderName(msg, nearbyNodes) };
+              return (
+                <MessageBubble message={resolvedMsg} isOwn={msg.source_id === deviceId} />
+              );
+            }}
+            ListEmptyComponent={renderEmpty}
+            contentContainerStyle={[
+              styles.listContent,
+              messages.length === 0 && styles.listContentEmpty,
+            ]}
+            showsVerticalScrollIndicator={false}
+          />
 
-        {/* Input Bar */}
-        <ChatInput onSend={sendMessage} disabled={!nodeReady} />
+          {/* Input Bar */}
+          <ChatInput onSend={sendMessage} disabled={!nodeReady} />
+        </KeyboardAvoidingView>
       </LinearGradient>
     </SafeAreaView>
   );
@@ -243,6 +251,10 @@ const styles = StyleSheet.create({
     color: 'rgba(255,255,255,0.6)',
     fontFamily: 'OpenSans-Regular',
     maxWidth: 100,
+  },
+  // ─── Keyboard-aware wrapper ───────────────────────────────────────────────
+  keyboardView: {
+    flex: 1,
   },
   // ─── List ─────────────────────────────────────────────────────────────────
   listContent: {

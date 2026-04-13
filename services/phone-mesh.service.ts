@@ -48,10 +48,21 @@ const TYPE_PRESENCE = 0x02;
 const CHUNK_SIZE = 10;
 
 /** How long each chunk is broadcast before the next one (ms) */
-const CHUNK_INTERVAL_MS = 600;
+const CHUNK_INTERVAL_MS = 400;
 
-/** Repeat each chunk N times for reliability */
-const CHUNK_REPEATS = 3;
+/**
+ * Repeat each chunk this many times per pass.
+ * At 400 ms each: 5 repeats = 2 seconds per chunk of advertisement time,
+ * giving the receiver plenty of scan windows to catch it.
+ */
+const CHUNK_REPEATS = 5;
+
+/**
+ * After the first full broadcast pass, wait this many ms and then send
+ * all chunks once more. This second pass catches receivers that were
+ * temporarily busy during the first pass.
+ */
+const SECOND_PASS_DELAY_MS = 1200;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -90,9 +101,19 @@ class PhoneMeshService {
   private isReceiving = false;
   private broadcastQueue: number[][] = [];
   private broadcastTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Holds the full set of chunks for the last message so a second pass can resend them */
+  private lastMessageChunks: number[][] = [];
 
   /** Accumulate chunks per message ID hex until all arrive */
   private chunkBuffers: Map<string, ChunkBuffer> = new Map();
+
+  /**
+   * Service-level dedup set — tracks message IDs already delivered to the
+   * callback. Prevents the same message from firing the callback more than
+   * once even if chunks arrive repeatedly (retries, relay echoes, etc.).
+   * Capped at 300 entries to prevent unbounded growth.
+   */
+  private seenMids: Set<string> = new Set();
 
   /** Callback when a message is fully reassembled */
   private onMessageReassembled: ((raw: Partial<MessagePacket>) => void) | null = null;
@@ -123,6 +144,24 @@ class PhoneMeshService {
   setMyIdentity(deviceId: string, displayName: string): void {
     this.myDeviceId = deviceId;
     this.myDisplayName = displayName;
+  }
+
+  /**
+   * Pre-mark a message ID as seen so that when our own broadcast echoes back
+   * from peers (relay), the service-level dedup immediately discards it.
+   * Call this from sendMessage() before broadcastMessage() to prevent the
+   * sender from receiving their own message.
+   */
+  markMessageSeen(msgIdHex: string): void {
+    this.seenMids.add(msgIdHex);
+  }
+
+  /**
+   * Check if a message ID has already been seen or pre-marked.
+   * Used by the BLE scan listener for early dedup before handleChunk.
+   */
+  isMessageSeen(msgIdHex: string): boolean {
+    return this.seenMids.has(msgIdHex);
   }
 
   // ── Callbacks ───────────────────────────────────────────────────────────────
@@ -300,11 +339,13 @@ class PhoneMeshService {
 
     console.log(`[PhoneMesh] Broadcasting message: ${totalChunks} chunks, payload: "${packet.pay}"`);
 
+    // Build one copy of each unique chunk advertisement
+    const uniqueChunks: number[][] = [];
     for (let i = 0; i < totalChunks; i++) {
       const slice = payloadBytes.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
       const padded = [...slice, ...new Array(CHUNK_SIZE - slice.length).fill(0)];
 
-      const advertisement = [
+      uniqueChunks.push([
         ...DM_HEADER,                        // [0-1]  "DM"
         TYPE_MESSAGE,                        // [2]    chunk type
         ...msgIdBytes,                       // [3-6]  message ID
@@ -313,15 +354,32 @@ class PhoneMeshService {
         ...srcIdBytes,                       // [9-10] source ID
         Math.min(packet.hops ?? 0, 15),      // [11]   hops
         ...padded,                           // [12-21] payload chunk
-      ];
+      ]);
+    }
 
-      // Queue each chunk CHUNK_REPEATS times for reliability
+    // Save for the second-pass retry
+    this.lastMessageChunks = uniqueChunks;
+
+    // First pass: queue each chunk CHUNK_REPEATS times
+    for (const chunk of uniqueChunks) {
       for (let r = 0; r < CHUNK_REPEATS; r++) {
-        this.broadcastQueue.push(advertisement);
+        this.broadcastQueue.push(chunk);
       }
     }
 
     this._processQueue();
+
+    // Second pass: after first pass completes + a short gap, resend each chunk once
+    // This catches receivers that were temporarily busy during the first pass.
+    const firstPassDuration = totalChunks * CHUNK_REPEATS * CHUNK_INTERVAL_MS;
+    setTimeout(() => {
+      if (this.lastMessageChunks.length > 0) {
+        for (const chunk of this.lastMessageChunks) {
+          this.broadcastQueue.push(chunk);
+        }
+        this._processQueue();
+      }
+    }, firstPassDuration + SECOND_PASS_DELAY_MS);
   }
 
   async stopAdvertising(): Promise<void> {
@@ -330,6 +388,23 @@ class PhoneMeshService {
       const BLEAdvertiser = require('react-native-ble-advertiser');
       await BLEAdvertiser.stopBroadcast();
     } catch (_) {}
+  }
+
+  /**
+   * Cancel any pending broadcast queue and stop the current advertisement.
+   * Call this when the user explicitly stops the mesh (Stop Scan button).
+   * Unlike stopAdvertising(), this also clears the chunk queue so no further
+   * chunks go out after the user asks to stop.
+   */
+  async stopAllBroadcasting(): Promise<void> {
+    // Clear pending chunks so the timer chain doesn't resume advertising
+    this.broadcastQueue = [];
+    this.lastMessageChunks = [];
+    if (this.broadcastTimer !== null) {
+      clearTimeout(this.broadcastTimer);
+      this.broadcastTimer = null;
+    }
+    await this.stopAdvertising();
   }
 
   // ── Receiving / Parsing ──────────────────────────────────────────────────────
@@ -389,6 +464,9 @@ class PhoneMeshService {
   handleChunk(chunk: MessageChunk): void {
     const key = chunk.msgIdHex;
 
+    // Fast-path dedup: already delivered or pre-marked (outgoing) — skip buffering entirely
+    if (this.seenMids.has(key)) return;
+
     if (!this.chunkBuffers.has(key)) {
       this.chunkBuffers.set(key, {
         chunks: new Map(),
@@ -410,22 +488,40 @@ class PhoneMeshService {
 
     // Check if we have all chunks
     if (buf.chunks.size === buf.totalChunks) {
-      const payload = this._reassemble(buf);
       this.chunkBuffers.delete(key);
 
+      // ── Service-level dedup ───────────────────────────────────────────────
+      // Block if already delivered — this fires BEFORE any React callback so
+      // it is immune to stale closure bugs in the hook layer.
+      if (this.seenMids.has(key)) return;
+
+      // Block messages we sent ourselves (srcIdHex === first 4 hex of our UUID)
+      if (this.myDeviceId) {
+        const myShortId = this.myDeviceId.replace(/-/g, '').slice(0, 4);
+        if (buf.srcIdHex === myShortId) {
+          console.log('[PhoneMesh] Ignoring own message echo');
+          return;
+        }
+      }
+
+      // Mark as seen — cap the set to prevent unbounded growth
+      this.seenMids.add(key);
+      if (this.seenMids.size > 300) {
+        this.seenMids.delete(this.seenMids.values().next().value!);
+      }
+
+      const payload = this._reassemble(buf);
       console.log(`[PhoneMesh] ✅ Message reassembled: "${payload}"`);
 
-      if (this.onMessageReassembled) {
-        this.onMessageReassembled({
-          mid: key,
-          src: buf.srcIdHex,
-          sn: 'Peer',
-          pay: payload,
-          ts: Date.now(),
-          ttl: 86400,
-          hops: (buf.hops ?? 0) + 1,
-        });
-      }
+      this.onMessageReassembled?.({
+        mid: key,
+        src: buf.srcIdHex,
+        sn: 'Peer',
+        pay: payload,
+        ts: Date.now(),
+        ttl: 86400,
+        hops: buf.hops ?? 0,
+      });
     }
   }
 
@@ -452,33 +548,28 @@ class PhoneMeshService {
   }
 
   private async _sendAdvertisement(data: number[]): Promise<void> {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const BLEAdvertiser = require('react-native-ble-advertiser');
+    BLEAdvertiser.setCompanyId(COMPANY_ID);
+
+    // Always stop cleanly before starting — Android only supports one active
+    // advertiser at a time. Give it a small settle gap (50 ms) after stopping.
+    try { await BLEAdvertiser.stopBroadcast(); } catch (_) {}
+    await new Promise(r => setTimeout(r, 50));
+
     try {
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const BLEAdvertiser = require('react-native-ble-advertiser');
-      BLEAdvertiser.setCompanyId(COMPANY_ID);
-
-      // Stop any current advertisement before starting new one
-      try { await BLEAdvertiser.stopBroadcast(); } catch (_) {}
-
       await BLEAdvertiser.broadcast(MESH_SERVICE_UUID.toUpperCase(), data, {
-        advertiseMode: 2, // LOW_LATENCY for fastest delivery
-        txPowerLevel: 3,  // HIGH power for maximum range
+        advertiseMode: 2, // LOW_LATENCY — fastest delivery
+        txPowerLevel: 3,  // HIGH — maximum range
         connectable: false,
         includeDeviceName: false,
         includeTxPowerLevel: false,
       });
-
-      // Keep advertising for the interval duration, then stop
-      setTimeout(async () => {
-        try {
-          // eslint-disable-next-line @typescript-eslint/no-require-imports
-          const BLEAdv = require('react-native-ble-advertiser');
-          await BLEAdv.stopBroadcast();
-        } catch (_) {}
-      }, CHUNK_INTERVAL_MS - 100);
     } catch (err) {
       console.warn('[PhoneMesh] Broadcast error:', err);
     }
+    // Chunk stays live for the full interval; _processQueue stops it via
+    // the next stopBroadcast() call at the start of the following send.
   }
 
   private _reassemble(buf: ChunkBuffer): string {
@@ -502,7 +593,9 @@ class PhoneMeshService {
       this.broadcastTimer = null;
     }
     this.broadcastQueue = [];
+    this.lastMessageChunks = [];
     this.chunkBuffers.clear();
+    this.seenMids.clear();
   }
 }
 

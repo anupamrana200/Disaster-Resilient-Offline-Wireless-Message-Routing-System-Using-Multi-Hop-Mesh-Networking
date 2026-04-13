@@ -15,8 +15,8 @@
  */
 
 import { useEffect, useCallback, useRef } from 'react';
-import { Vibration } from 'react-native';
 import { v4 as uuidv4 } from 'uuid';
+import { showMessageNotification } from '@/services/notification.service';
 import { useBLE } from './useBLE';
 import { useNodesSlice } from '@/slices/nodes.slice';
 import { useMessagesSlice } from '@/slices/messages.slice';
@@ -31,6 +31,33 @@ import { getBLEService } from '@/services/ble-adapter';
 import { getPhoneMeshService } from '@/services/phone-mesh-adapter';
 
 const MAX_HOPS = 5;
+
+/**
+ * Module-level permanent dedup set.
+ *
+ * This lives OUTSIDE the React component so it is:
+ *   - Never reset by re-renders
+ *   - Never stale due to React closure capture
+ *   - Shared across EVERY useMesh() call in the app
+ *
+ * Populated in two places:
+ *   1. sendMessage()      — our own outgoing messages (both full UUID + 8-char hex)
+ *   2. phoneMesh callback — messages we receive and process
+ *
+ * Any message ID already in this set is immediately discarded, even if the
+ * service-level seenMids or Redux seenIds somehow missed it.
+ *
+ * Never cleared — kept for the lifetime of the app process.
+ */
+const _processedMids = new Set<string>();
+
+/**
+ * Module-level auto-start guard — prevents multiple useMesh() instances
+ * (e.g. ChatScreen + NodesScreen both mounted as tabs) from each registering
+ * their own BLE scan listener. Only the first instance starts scanning;
+ * the rest skip the auto-start so there is exactly ONE active listener.
+ */
+let _autoStarted = false;
 
 interface UseMeshResult {
   messages: Message[];
@@ -54,7 +81,16 @@ export function useMesh(): UseMeshResult {
 
   const syncIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const cleanupListeners = useRef<Map<string, () => void>>(new Map());
-  const hasAutoStarted = useRef(false);
+
+  // Always-fresh refs — updated on every render so callbacks never read stale
+  // Redux state through a frozen closure (the root cause of duplicate messages,
+  // wrong sender names, and the sender receiving their own notifications).
+  const seenIdsRef = useRef<string[]>([]);
+  const myNodeIdRef = useRef<string>('');
+  const nearbyNodesRef = useRef<typeof nodesSlice.nearbyNodes>([]);
+  seenIdsRef.current = msgsSlice.seenIds;
+  myNodeIdRef.current = nodesSlice.myNodeId;
+  nearbyNodesRef.current = nodesSlice.nearbyNodes;
 
   // ─── Boot ──────────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -66,10 +102,13 @@ export function useMesh(): UseMeshResult {
 
   // ─── Auto-start discovery ──────────────────────────────────────────────────
   // Start scanning + presence beacon as soon as BLE is ready and we have an
-  // identity. Users should never need to tap "Start Scan" manually.
+  // identity. Uses a module-level flag (_autoStarted) so that only the FIRST
+  // useMesh() instance triggers the scan — ChatScreen and NodesScreen both
+  // mount and call useMesh(), and without this guard each would register its
+  // own DeviceEventEmitter listener causing duplicate chunk processing.
   useEffect(() => {
-    if (ble.isReady && nodesSlice.myNodeId && !hasAutoStarted.current) {
-      hasAutoStarted.current = true;
+    if (ble.isReady && nodesSlice.myNodeId && !_autoStarted) {
+      _autoStarted = true;
       console.log('[Mesh] Auto-starting BLE discovery...');
       ble.startScan();
     }
@@ -91,28 +130,40 @@ export function useMesh(): UseMeshResult {
     phoneMesh.setMessageCallback((raw: Partial<MessagePacket>) => {
       if (!raw.mid || !raw.pay) return;
 
-      // Dedup — also blocks our own broadcast echoing back to us
-      if (msgsSlice.seenIds.includes(raw.mid)) return;
+      // Layer 1 — own-message filter (FIRST — most reliable, restart-proof).
+      // raw.src is the originator's srcIdHex (first 4 hex chars of their UUID,
+      // encoded as 2 bytes in the BLE advertisement packet). We compare it
+      // against the same 4-char prefix of our own UUID. If they match, this
+      // is our own message echoed back by a relay phone — drop it immediately.
+      // This MUST run before _processedMids so it works even after an app
+      // restart when the module-level Set is freshly empty, and also covers
+      // the edge case where myNodeIdRef.current was not yet populated when
+      // _processedMids was checked.
+      const myId = myNodeIdRef.current;
+      if (myId) {
+        const myShortId = myId.replace(/-/g, '').slice(0, 4);
+        if (raw.src === myShortId) return;
+      }
 
-      // Ignore messages we sent ourselves (srcIdHex is first 4 hex chars of our UUID)
-      const myShortId = nodesSlice.myNodeId.replace(/-/g, '').slice(0, 4);
-      if (raw.src === myShortId) return;
+      // Layer 2 — module-level permanent Set (fast dedup for all other msgs).
+      if (_processedMids.has(raw.mid)) return;
 
-      // Mark seen immediately — before relay — so our own re-broadcast
-      // doesn't echo back and get processed again
+      // Layer 3 — Redux seenIds via always-fresh ref (backup check)
+      if (seenIdsRef.current.includes(raw.mid)) return;
+
+      // Mark seen at ALL layers before doing any work so that if this callback
+      // is somehow re-entered (e.g. rapid relay echo), it's immediately blocked.
+      _processedMids.add(raw.mid);
       msgsSlice.dispatch(msgsSlice.addSeenId(raw.mid));
 
-      // Resolve sender display name from known nearby nodes.
-      // The srcIdHex (4 hex chars = 2 bytes) is the prefix of the deviceIdHex
-      // used in presence beacons (12 hex chars), so a startsWith match works.
+      // Resolve sender display name — read through ref so we always get the
+      // latest nearbyNodes list, even if the presence beacon arrived after
+      // this callback was first registered.
       const srcHex = raw.src ?? '';
-      const peerNode = nodesSlice.nearbyNodes.find(n =>
+      const peerNode = nearbyNodesRef.current.find(n =>
         n.node_id.replace('phone-', '').startsWith(srcHex),
       );
       const sourceName = peerNode?.name || `Peer-${srcHex.slice(0, 4)}`;
-
-      // Vibrate to notify user of incoming message
-      Vibration.vibrate([0, 200, 100, 200]); // short-short pattern
 
       const msg: Message = {
         message_id: raw.mid,
@@ -128,11 +179,17 @@ export function useMesh(): UseMeshResult {
 
       if (!isExpired(msg) && msg.hops <= MAX_HOPS) {
         msgsSlice.dispatch(msgsSlice.addMessageAsync(msg));
+        // Notify user — single vibration + notification panel entry
+        showMessageNotification(sourceName, msg.payload).catch(() => {});
         // Relay via BLE advertisement so phones not directly in range of the
         // original sender can still receive the message (multi-hop delivery)
         phoneMesh.broadcastMessage(messageToPacket(msg)).catch(() => {});
         // Relay to any connected ESP32 nodes
         transmitToAllNodes(msg);
+        // Increment relay count for the source node so the Nodes screen shows it
+        if (peerNode) {
+          nodesSlice.dispatch(nodesSlice.incrementRelayCount(peerNode.node_id));
+        }
       }
     });
 
@@ -220,16 +277,28 @@ export function useMesh(): UseMeshResult {
         hops: 0,
       };
 
+      // Mark the message ID as seen at ALL dedup layers BEFORE any async
+      // operation. This closes the timing window where a relay echo could
+      // arrive during the await below and slip past the checks.
+      //
+      //   _processedMids — module-level permanent Set, shared across all
+      //                    useMesh() instances, never reset, never stale
+      //   seenMids        — service-level Set inside PhoneMeshService
+      //   Redux seenIds   — for the useRef-based hook-level check
+      //
+      // Both the 8-char BLE chunk ID and the full UUID are added so that
+      // no matter which form appears in a relay's raw.mid, it is blocked.
+      const shortMid = msg.message_id.replace(/-/g, '').slice(0, 8);
+      _processedMids.add(shortMid);
+      _processedMids.add(msg.message_id);
+      msgsSlice.dispatch(msgsSlice.addSeenId(shortMid));
+      getPhoneMeshService().markMessageSeen(shortMid);
+
       // Optimistically add to local history
       await msgsSlice.dispatch(msgsSlice.addMessageAsync(msg));
 
       const packet = messageToPacket(msg);
       let broadcastOk = false;
-
-      // Mark the truncated message ID (used in BLE chunks) as seen so we don't
-      // process our own advertisement broadcast as an incoming message
-      const shortMid = msg.message_id.replace(/-/g, '').slice(0, 8);
-      msgsSlice.dispatch(msgsSlice.addSeenId(shortMid));
 
       // Channel 1: Broadcast via BLE advertisement (phone-to-phone)
       // This works connectionlessly — no GATT needed
@@ -299,12 +368,28 @@ export function useMesh(): UseMeshResult {
     async (rawJson: string, _fromNodeId: string) => {
       try {
         const packet: MessagePacket = JSON.parse(rawJson);
-        if (msgsSlice.seenIds.includes(packet.mid)) return;
+
+        // ── Own-message guard ─────────────────────────────────────────────────
+        // packet.src is the originator's full UUID (written by sendMessage →
+        // messageToPacket). If it matches our device ID this message was sent
+        // by us and is now being echoed back by an ESP32 relay — drop it.
+        // This check uses myNodeIdRef (loaded from AsyncStorage) so it works
+        // correctly even after an app restart when _processedMids is empty.
+        if (myNodeIdRef.current && packet.src === myNodeIdRef.current) return;
+
+        // Use module-level permanent dedup first (same as phoneMesh path)
+        if (_processedMids.has(packet.mid)) return;
+        if (seenIdsRef.current.includes(packet.mid)) return;
+
+        _processedMids.add(packet.mid);
+        msgsSlice.dispatch(msgsSlice.addSeenId(packet.mid));
 
         const msg = packetToMessage(packet);
         if (isExpired(msg) || msg.hops > MAX_HOPS) return;
 
         await msgsSlice.dispatch(msgsSlice.addMessageAsync(msg));
+        // Notify user — single vibration + notification panel entry
+        showMessageNotification(msg.source_name, msg.payload).catch(() => {});
 
         // Relay: re-broadcast via phone mesh + other GATT nodes
         const phoneMesh = getPhoneMeshService();
@@ -338,9 +423,14 @@ export function useMesh(): UseMeshResult {
   }, [ble.startScan, nodesSlice.myNodeId, nodesSlice.myDisplayName]);
 
   const stopDiscovery = useCallback(() => {
+    // Stop scanning — no new messages or nodes will be received
     ble.stopScan();
+    // Clear broadcast queue + stop advertising — no more chunks go out
     const phoneMesh = getPhoneMeshService();
-    phoneMesh.stopAdvertising().catch((_: any) => {});
+    phoneMesh.stopAllBroadcasting().catch((_: any) => {});
+    // Reset module-level auto-start flag so the next startDiscovery()
+    // (or app re-navigation) can trigger a fresh scan.
+    _autoStarted = false;
   }, [ble.stopScan]);
 
   return {
@@ -348,7 +438,13 @@ export function useMesh(): UseMeshResult {
     pendingCount: msgsSlice.pendingQueue.length,
     nearbyNodes: nodesSlice.nearbyNodes,
     connectedNodeIds: nodesSlice.connectedNodeIds,
-    isScanning: ble.isScanning,
+    // Use Redux isScanning (shared state) instead of ble.isScanning (local to
+    // this useBLE instance). Multiple tab screens each create their own useMesh
+    // → useBLE instance. When the Nodes screen stops scanning, its useBLE local
+    // state updates but the Chat screen's useBLE instance still reads true.
+    // Redux isScanning is updated by whichever instance calls stopScan() and
+    // reflects the real state across all screens immediately.
+    isScanning: nodesSlice.isScanning,
     myNodeId: nodesSlice.myNodeId,
     myDisplayName: nodesSlice.myDisplayName,
     sendMessage,

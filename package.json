@@ -1,7 +1,7 @@
 {
   "name": "disaster-resilient-offline-wireless-message-routing-system",
   "main": "expo-router/entry",
-  "version": "5.0.0",
+  "version": "5.0.1",
   "private": true,
   "scripts": {
     "postinstall": "node scripts/postinstall.js",
@@ -47,6 +47,7 @@
     "expo-linear-gradient": "~15.0.8",
     "expo-linking": "~8.0.11",
     "expo-location": "^55.1.6",
+    "expo-notifications": "~0.32.16",
     "expo-router": "~6.0.23",
     "expo-splash-screen": "~31.0.13",
     "expo-status-bar": "~3.0.9",

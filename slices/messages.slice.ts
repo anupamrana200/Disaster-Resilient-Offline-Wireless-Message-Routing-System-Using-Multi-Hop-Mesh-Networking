@@ -153,7 +153,15 @@ const slice = createSlice({
       state.isLoading = false;
       state.messages = payload.messages;
       state.pendingQueue = payload.pendingQueue;
-      state.seenIds = payload.seenIds;
+      // Expand seenIds: for every full UUID already stored, also add its 8-char
+      // short version. This ensures relay echoes are blocked by seenIdsRef even
+      // after an app restart when the dedup Sets (_processedMids, seenMids) are
+      // freshly empty.
+      const expanded = new Set<string>(payload.seenIds);
+      for (const id of payload.seenIds) {
+        expanded.add(id.replace(/-/g, '').slice(0, 8).toLowerCase());
+      }
+      state.seenIds = Array.from(expanded);
     });
     builder.addCase(loadMessagesAsync.rejected, state => {
       state.isLoading = false;
@@ -161,11 +169,25 @@ const slice = createSlice({
 
     // addMessageAsync
     builder.addCase(addMessageAsync.fulfilled, (state, { payload }) => {
-      const exists = state.messages.some(m => m.message_id === payload.message_id);
+      // Dedup by exact ID AND by 8-char short prefix.
+      // Relay messages carry a truncated ID ("460c8400") while the original
+      // sent message has a full UUID ("460c8400-e29b-..."). Without the prefix
+      // check, both would pass the exact-match test and appear as duplicates.
+      const shortPayload = payload.message_id.replace(/-/g, '').slice(0, 8).toLowerCase();
+      const exists = state.messages.some(m => {
+        if (m.message_id === payload.message_id) return true;
+        return m.message_id.replace(/-/g, '').slice(0, 8).toLowerCase() === shortPayload;
+      });
       if (!exists) {
         state.messages.push(payload);
+        // Add both the exact ID and its 8-char short form to seenIds so that
+        // relay echoes (which carry the truncated ID) are always blocked by
+        // seenIdsRef.current even before a React re-render.
         if (!state.seenIds.includes(payload.message_id)) {
           state.seenIds.push(payload.message_id);
+        }
+        if (!state.seenIds.includes(shortPayload)) {
+          state.seenIds.push(shortPayload);
         }
       }
     });

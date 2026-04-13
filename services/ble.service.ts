@@ -78,13 +78,18 @@ class BLEService {
       const androidVersion = parseInt(String(Platform.Version), 10);
 
       if (androidVersion >= 31) {
-        // Android 12+ — request all BLE permissions
-        const results = await PermissionsAndroid.requestMultiple([
+        // Android 12+ — request all BLE permissions.
+        // Android 13+ (API 33) also needs POST_NOTIFICATIONS for alert banners.
+        const permsToRequest: string[] = [
           PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
           PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
           PermissionsAndroid.PERMISSIONS.BLUETOOTH_ADVERTISE,
           PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
-        ]);
+        ];
+        if (androidVersion >= 33) {
+          permsToRequest.push('android.permission.POST_NOTIFICATIONS');
+        }
+        const results = await PermissionsAndroid.requestMultiple(permsToRequest);
 
         // Essential permissions: SCAN + LOCATION are needed for discovery
         const scanOk = results[PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN] === PermissionsAndroid.RESULTS.GRANTED;

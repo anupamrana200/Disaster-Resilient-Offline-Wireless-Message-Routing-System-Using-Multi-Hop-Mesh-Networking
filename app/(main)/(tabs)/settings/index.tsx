@@ -2,7 +2,7 @@
  * Settings Screen — device identity, TTL config, and storage management.
  */
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   View,
   Text,
@@ -11,8 +11,7 @@ import {
   StyleSheet,
   SafeAreaView,
   ScrollView,
-  Alert,
-  Switch,
+  Animated,
 } from 'react-native';
 import { LinearGradient } from 'expo-linear-gradient';
 import { useNodeId } from '@/hooks/useNodeId';
@@ -30,52 +29,106 @@ const TTL_OPTIONS = [
   { label: '24 Hours', value: 86400 },
 ];
 
+type ToastType = 'success' | 'error' | 'info';
+
+interface Toast {
+  message: string;
+  type: ToastType;
+}
+
 export default function SettingsScreen() {
   const { deviceId, displayName, updateDisplayName } = useNodeId();
   const { dispatch: nodesDispatch, defaultTtl, setDefaultTtl } = useNodesSlice();
   const { dispatch: msgsDispatch, messages, pendingQueue, clearMessages } = useMessagesSlice();
 
-  const [nameInput, setNameInput] = useState(displayName);
+  const [nameInput, setNameInput] = useState('');
   const [isSaving, setIsSaving] = useState(false);
+  const [toast, setToast] = useState<Toast | null>(null);
+  const [confirmClear, setConfirmClear] = useState(false);
+  const [customTtlValue, setCustomTtlValue] = useState('');
+  const [customTtlUnit, setCustomTtlUnit] = useState<'minutes' | 'hours'>('minutes');
 
-  // Keep the text field in sync with Redux when storage loads asynchronously
+  const toastOpacity = useRef(new Animated.Value(0)).current;
+  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // One-time sync: populate name field when identity loads from storage.
+  // Using a ref so this only fires once even if displayName changes after a save.
+  const initialized = useRef(false);
   useEffect(() => {
-    if (displayName && displayName !== nameInput) {
+    if (displayName && !initialized.current) {
+      initialized.current = true;
       setNameInput(displayName);
     }
   }, [displayName]);
-  const [customTtlValue, setCustomTtlValue] = useState('');
-  const [customTtlUnit, setCustomTtlUnit] = useState<'minutes' | 'hours'>('minutes');
+
+  const showToast = useCallback((message: string, type: ToastType = 'success') => {
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+    setToast({ message, type });
+    toastOpacity.setValue(0);
+    Animated.timing(toastOpacity, {
+      toValue: 1,
+      duration: 200,
+      useNativeDriver: true,
+    }).start();
+    toastTimer.current = setTimeout(() => {
+      Animated.timing(toastOpacity, {
+        toValue: 0,
+        duration: 300,
+        useNativeDriver: true,
+      }).start(() => setToast(null));
+    }, 2500);
+  }, [toastOpacity]);
 
   const handleSaveName = async () => {
     if (!nameInput.trim()) return;
     setIsSaving(true);
     await updateDisplayName(nameInput.trim());
     setIsSaving(false);
-    Alert.alert('Saved', 'Your display name has been updated.');
+    showToast('Display name saved', 'success');
   };
 
-  const handleClearData = () => {
-    Alert.alert(
-      'Clear All Data',
-      'This will delete all messages and peer history. This cannot be undone.',
-      [
-        { text: 'Cancel', style: 'cancel' },
-        {
-          text: 'Clear',
-          style: 'destructive',
-          onPress: async () => {
-            await clearAllMeshData();
-            msgsDispatch(clearMessages());
-            Alert.alert('Done', 'All mesh data cleared.');
-          },
-        },
-      ],
-    );
+  const handleClearData = async () => {
+    await clearAllMeshData();
+    msgsDispatch(clearMessages());
+    setConfirmClear(false);
+    showToast('All mesh data cleared', 'info');
+  };
+
+  const handleSetCustomTtl = () => {
+    const num = parseInt(customTtlValue, 10);
+    if (!num || num <= 0) {
+      showToast('Please enter a positive number', 'error');
+      return;
+    }
+    const seconds = customTtlUnit === 'hours' ? num * 3600 : num * 60;
+    nodesDispatch(setDefaultTtl(seconds));
+    setCustomTtlValue('');
+    showToast(`TTL set to ${num} ${customTtlUnit}`, 'success');
+  };
+
+  const toastColors: Record<ToastType, string> = {
+    success: '#00c896',
+    error: '#ff453a',
+    info: '#60b4ff',
   };
 
   return (
     <SafeAreaView style={styles.safeArea}>
+      {/* Toast — rendered at the SafeAreaView root so it sits above the
+          LinearGradient and ScrollView on Android (zIndex is stacking-context
+          scoped; placing it here guarantees it is never occluded). */}
+      {toast && (
+        <Animated.View
+          style={[
+            styles.toast,
+            { backgroundColor: toastColors[toast.type] + '30', borderColor: toastColors[toast.type], opacity: toastOpacity },
+          ]}
+        >
+          <View style={[styles.toastDot, { backgroundColor: toastColors[toast.type] }]} />
+          <Text style={[styles.toastText, { color: toastColors[toast.type] }]}>{toast.message}</Text>
+        </Animated.View>
+      )}
+
       <LinearGradient colors={['#0a0e1a', '#0d1117']} style={styles.container}>
         <ScrollView contentContainerStyle={styles.scroll} showsVerticalScrollIndicator={false}>
           {/* Header */}
@@ -169,16 +222,7 @@ export default function SettingsScreen() {
               </View>
               <TouchableOpacity
                 style={styles.setButton}
-                onPress={() => {
-                  const num = parseInt(customTtlValue, 10);
-                  if (!num || num <= 0) {
-                    Alert.alert('Invalid', 'Please enter a positive integer.');
-                    return;
-                  }
-                  const seconds = customTtlUnit === 'hours' ? num * 3600 : num * 60;
-                  nodesDispatch(setDefaultTtl(seconds));
-                  Alert.alert('TTL Set', `Message lifetime set to ${num} ${customTtlUnit}.`);
-                }}
+                onPress={handleSetCustomTtl}
               >
                 <Text style={styles.setButtonText}>Set</Text>
               </TouchableOpacity>
@@ -198,14 +242,37 @@ export default function SettingsScreen() {
 
           {/* Danger Zone */}
           <Section title="Danger Zone">
-            <TouchableOpacity
-              id="settings-clear-data"
-              style={styles.dangerButton}
-              onPress={handleClearData}
-              activeOpacity={0.8}
-            >
-              <Text style={styles.dangerButtonText}>🗑 Clear All Mesh Data</Text>
-            </TouchableOpacity>
+            {confirmClear ? (
+              <View style={styles.confirmCard}>
+                <Text style={styles.confirmTitle}>Delete all messages?</Text>
+                <Text style={styles.confirmDesc}>
+                  This will permanently remove all messages and peer history.
+                </Text>
+                <View style={styles.confirmButtons}>
+                  <TouchableOpacity
+                    style={styles.confirmCancel}
+                    onPress={() => setConfirmClear(false)}
+                  >
+                    <Text style={styles.confirmCancelText}>Cancel</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={styles.confirmDelete}
+                    onPress={handleClearData}
+                  >
+                    <Text style={styles.confirmDeleteText}>Delete</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            ) : (
+              <TouchableOpacity
+                id="settings-clear-data"
+                style={styles.dangerButton}
+                onPress={() => setConfirmClear(true)}
+                activeOpacity={0.8}
+              >
+                <Text style={styles.dangerButtonText}>Clear All Mesh Data</Text>
+              </TouchableOpacity>
+            )}
           </Section>
 
           {/* App Info */}
@@ -248,6 +315,32 @@ const styles = StyleSheet.create({
   safeArea: { flex: 1, backgroundColor: '#0a0e1a' },
   container: { flex: 1 },
   scroll: { paddingBottom: 40 },
+
+  // ─── Toast ────────────────────────────────────────────────────────────────
+  // Not absolute — flows naturally at the top of SafeAreaView above the
+  // LinearGradient so it's never occluded by the scroll content on Android.
+  toast: {
+    marginHorizontal: 16,
+    marginTop: 10,
+    marginBottom: 4,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    borderRadius: 12,
+    borderWidth: 1,
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+  },
+  toastDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+  },
+  toastText: {
+    fontSize: 14,
+    fontFamily: 'OpenSans-Semibold',
+    flex: 1,
+  },
 
   header: { paddingHorizontal: 20, paddingTop: 16, paddingBottom: 8 },
   title: { fontSize: 26, fontWeight: '800', color: '#f0f2f5', fontFamily: 'OpenSans-Bold' },
@@ -385,6 +478,7 @@ const styles = StyleSheet.create({
     textAlign: 'center',
   },
 
+  // ─── Danger Zone ──────────────────────────────────────────────────────────
   dangerButton: {
     backgroundColor: '#ff453a22',
     borderRadius: 12,
@@ -394,6 +488,59 @@ const styles = StyleSheet.create({
     borderColor: '#ff453a',
   },
   dangerButtonText: { color: '#ff453a', fontWeight: '700', fontSize: 14, fontFamily: 'OpenSans-Bold' },
+
+  // ─── Inline Confirm Card ──────────────────────────────────────────────────
+  confirmCard: {
+    backgroundColor: '#ff453a11',
+    borderRadius: 12,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: '#ff453a55',
+    gap: 8,
+  },
+  confirmTitle: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: '#ff453a',
+    fontFamily: 'OpenSans-Bold',
+  },
+  confirmDesc: {
+    fontSize: 13,
+    color: 'rgba(255,255,255,0.5)',
+    fontFamily: 'OpenSans-Regular',
+    lineHeight: 18,
+  },
+  confirmButtons: {
+    flexDirection: 'row',
+    gap: 10,
+    marginTop: 4,
+  },
+  confirmCancel: {
+    flex: 1,
+    backgroundColor: 'rgba(255,255,255,0.08)',
+    borderRadius: 10,
+    padding: 10,
+    alignItems: 'center',
+  },
+  confirmCancelText: {
+    color: 'rgba(255,255,255,0.7)',
+    fontWeight: '600',
+    fontSize: 14,
+    fontFamily: 'OpenSans-Semibold',
+  },
+  confirmDelete: {
+    flex: 1,
+    backgroundColor: '#ff453a',
+    borderRadius: 10,
+    padding: 10,
+    alignItems: 'center',
+  },
+  confirmDeleteText: {
+    color: '#fff',
+    fontWeight: '700',
+    fontSize: 14,
+    fontFamily: 'OpenSans-Bold',
+  },
 
   footer: { marginTop: 32, alignItems: 'center', paddingHorizontal: 20 },
   footerText: { fontSize: 12, color: 'rgba(255,255,255,0.25)', fontFamily: 'OpenSans-Regular', textAlign: 'center' },
