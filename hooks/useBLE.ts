@@ -231,8 +231,8 @@ export function useBLE(): UseBLEResult {
                   // advertisements back to its own scan listener. Android 12+
                   // does not. Without this check the sender would receive and
                   // relay its own message, causing the receiver to see it twice.
-                  const myShort = myNodeIdRef.current.replace(/-/g, '').slice(0, 4);
-                  if (myShort && chunk.srcIdHex === myShort) {
+                  const myShort = myNodeIdRef.current.replace(/-/g, '').slice(0, 4).toLowerCase();
+                  if (myShort && chunk.srcIdHex.toLowerCase() === myShort) {
                     console.log(`[BLE] Dropping own chunk (self-scan) msg=${chunk.msgIdHex}`);
                     return;
                   }

@@ -151,9 +151,11 @@ class PhoneMeshService {
    * from peers (relay), the service-level dedup immediately discards it.
    * Call this from sendMessage() before broadcastMessage() to prevent the
    * sender from receiving their own message.
+   * Always normalizes to lowercase so hex IDs from BLE bytes (always lowercase)
+   * match UUIDs that may contain uppercase chars on some platforms.
    */
   markMessageSeen(msgIdHex: string): void {
-    this.seenMids.add(msgIdHex);
+    this.seenMids.add(msgIdHex.toLowerCase());
   }
 
   /**
@@ -161,7 +163,7 @@ class PhoneMeshService {
    * Used by the BLE scan listener for early dedup before handleChunk.
    */
   isMessageSeen(msgIdHex: string): boolean {
-    return this.seenMids.has(msgIdHex);
+    return this.seenMids.has(msgIdHex.toLowerCase());
   }
 
   // ── Callbacks ───────────────────────────────────────────────────────────────
@@ -462,7 +464,22 @@ class PhoneMeshService {
    * Fires onMessageReassembled when all chunks for a message arrive.
    */
   handleChunk(chunk: MessageChunk): void {
-    const key = chunk.msgIdHex;
+    // ── Own-message guard (ABSOLUTE FIRST — runs before every other check) ──
+    // Compares the srcIdHex from the BLE packet (first 4 hex chars / 2 bytes of
+    // the source UUID) against our own identity. This catches:
+    //   • Android ≤11 self-scan: the device receives its own advertisements
+    //   • Relay echo: a peer relays our message back and we receive it again
+    // Must be first because seenMids may be transiently empty (fresh restart,
+    // cleared by destroy(), or pre-mark not yet flushed).
+    if (this.myDeviceId) {
+      const myShortId = this.myDeviceId.replace(/-/g, '').slice(0, 4).toLowerCase();
+      if (chunk.srcIdHex.toLowerCase() === myShortId) {
+        console.log(`[PhoneMesh] Dropping own message chunk (src=${chunk.srcIdHex})`);
+        return;
+      }
+    }
+
+    const key = chunk.msgIdHex.toLowerCase();
 
     // Fast-path dedup: already delivered or pre-marked (outgoing) — skip buffering entirely
     if (this.seenMids.has(key)) return;
@@ -490,19 +507,8 @@ class PhoneMeshService {
     if (buf.chunks.size === buf.totalChunks) {
       this.chunkBuffers.delete(key);
 
-      // ── Service-level dedup ───────────────────────────────────────────────
-      // Block if already delivered — this fires BEFORE any React callback so
-      // it is immune to stale closure bugs in the hook layer.
+      // ── Service-level dedup (double-check after reassembly) ──────────────
       if (this.seenMids.has(key)) return;
-
-      // Block messages we sent ourselves (srcIdHex === first 4 hex of our UUID)
-      if (this.myDeviceId) {
-        const myShortId = this.myDeviceId.replace(/-/g, '').slice(0, 4);
-        if (buf.srcIdHex === myShortId) {
-          console.log('[PhoneMesh] Ignoring own message echo');
-          return;
-        }
-      }
 
       // Mark as seen — cap the set to prevent unbounded growth
       this.seenMids.add(key);

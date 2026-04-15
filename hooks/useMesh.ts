@@ -141,8 +141,8 @@ export function useMesh(): UseMeshResult {
       // _processedMids was checked.
       const myId = myNodeIdRef.current;
       if (myId) {
-        const myShortId = myId.replace(/-/g, '').slice(0, 4);
-        if (raw.src === myShortId) return;
+        const myShortId = myId.replace(/-/g, '').slice(0, 4).toLowerCase();
+        if ((raw.src ?? '').toLowerCase() === myShortId) return;
       }
 
       // Layer 2 — module-level permanent Set (fast dedup for all other msgs).
@@ -181,9 +181,14 @@ export function useMesh(): UseMeshResult {
         msgsSlice.dispatch(msgsSlice.addMessageAsync(msg));
         // Notify user — single vibration + notification panel entry
         showMessageNotification(sourceName, msg.payload).catch(() => {});
-        // Relay via BLE advertisement so phones not directly in range of the
-        // original sender can still receive the message (multi-hop delivery)
-        phoneMesh.broadcastMessage(messageToPacket(msg)).catch(() => {});
+        // NOTE: We intentionally do NOT re-broadcast via BLE advertisement here.
+        // Re-broadcasting received phone-mesh messages creates a relay loop:
+        //   Phone A sends → Phone B receives → Phone B re-broadcasts →
+        //   Phone A receives its own message back as "Peer-XXXX" with hops+1.
+        // Since each phone already advertises its OWN messages directly, and any
+        // phone in direct range will receive them, re-relaying via advertisement
+        // only causes duplicates and echo without adding real multi-hop value.
+        // Multi-hop relay to ESP32 nodes (GATT) is kept below.
         // Relay to any connected ESP32 nodes
         transmitToAllNodes(msg);
         // Increment relay count for the source node so the Nodes screen shows it
@@ -288,9 +293,12 @@ export function useMesh(): UseMeshResult {
       //
       // Both the 8-char BLE chunk ID and the full UUID are added so that
       // no matter which form appears in a relay's raw.mid, it is blocked.
-      const shortMid = msg.message_id.replace(/-/g, '').slice(0, 8);
+      // Normalize to lowercase — BLE bytes decoded via toString(16) are always
+      // lowercase, so the comparison must use the same case everywhere.
+      const shortMid = msg.message_id.replace(/-/g, '').slice(0, 8).toLowerCase();
       _processedMids.add(shortMid);
-      _processedMids.add(msg.message_id);
+      _processedMids.add(msg.message_id.toLowerCase());
+      _processedMids.add(msg.message_id); // also add original in case ref is stored
       msgsSlice.dispatch(msgsSlice.addSeenId(shortMid));
       getPhoneMeshService().markMessageSeen(shortMid);
 
