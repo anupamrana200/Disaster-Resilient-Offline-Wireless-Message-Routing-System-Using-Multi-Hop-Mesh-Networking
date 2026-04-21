@@ -43,29 +43,30 @@ function timeAgo(ts: number): string {
 }
 
 export default function NodeCard({ node, onConnect, onDisconnect, isConnecting }: Props) {
-  const isESP = node.type === 'esp32-lora';
+  const isMeshtastic = node.type === 'meshtastic';
   const isPhone = node.type === 'ble-phone';
 
-  const typeLabel = isESP ? 'ESP32 LoRa Gateway' : '📶 Phone Peer (Mesh)';
-  const typeIcon = isESP ? '📻' : '📱';
+  const typeLabel = isMeshtastic ? 'LoRa Gateway (Meshtastic)' : '📶 Phone Peer (Mesh)';
+  const typeIcon = isMeshtastic ? '📡' : '📱';
 
   // Phone peers use connectionless advertising — no GATT connection needed
-  const showConnectButton = isESP;
+  const showConnectButton = isMeshtastic;
 
   return (
-    <View style={[styles.card, node.is_connected && styles.cardConnected, isPhone && styles.cardPhone]}>
+    <View style={[styles.card, node.is_connected && styles.cardConnected, isPhone && styles.cardPhone, isMeshtastic && styles.cardMeshtastic]}>
       {/* Left: icon + info */}
       <View style={styles.left}>
         <View style={[
           styles.iconBox,
           node.is_connected && styles.iconBoxConnected,
           isPhone && styles.iconBoxPhone,
+          isMeshtastic && !node.is_connected && styles.iconBoxMeshtastic,
         ]}>
           <Text style={styles.icon}>{typeIcon}</Text>
         </View>
         <View style={styles.info}>
           <Text style={styles.name} numberOfLines={1}>{node.name}</Text>
-          <Text style={[styles.type, isPhone && styles.typePhone]}>{typeLabel}</Text>
+          <Text style={[styles.type, isPhone && styles.typePhone, isMeshtastic && styles.typeMeshtastic]}>{typeLabel}</Text>
           <Text style={styles.meta}>
             {node.relay_count > 0 ? `↷ ${node.relay_count} relayed · ` : ''}
             {timeAgo(node.last_seen)}
@@ -128,6 +129,10 @@ const styles = StyleSheet.create({
     borderColor: 'rgba(96,180,255,0.25)',
     backgroundColor: '#131d30',
   },
+  cardMeshtastic: {
+    borderColor: 'rgba(255,159,10,0.35)',
+    backgroundColor: '#1e1a0d',
+  },
   left: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -168,6 +173,13 @@ const styles = StyleSheet.create({
   },
   typePhone: {
     color: '#60b4ff',
+  },
+  typeMeshtastic: {
+    color: '#ff9f0a',
+  },
+  iconBoxMeshtastic: {
+    borderColor: 'rgba(255,159,10,0.4)',
+    backgroundColor: '#ff9f0a15',
   },
   meta: {
     fontSize: 10,

@@ -261,15 +261,13 @@ export function useBLE(): UseBLEResult {
                 relay_count: 0,
               }));
             } else {
-              // Check for ESP32 node (identified by device name)
-              const isESP = deviceName.toLowerCase().includes('esp') ||
-                            deviceName.toLowerCase().includes('lora');
-              if (isESP) {
+              // Meshtastic nodes advertise their name as "Meshtastic_xxxx"
+              if (deviceName.toLowerCase().includes('meshtastic')) {
                 dispatch(upsertNode({
                   node_id: deviceId,
-                  name: deviceName.trim() || `ESP32-${deviceId.slice(-5).replace(':', '')}`,
+                  name: deviceName.trim() || `Meshtastic-${deviceId.slice(-5).replace(':', '')}`,
                   rssi,
-                  type: 'esp32-lora',
+                  type: 'meshtastic',
                   last_seen: Date.now(),
                   is_connected: false,
                   relay_count: 0,

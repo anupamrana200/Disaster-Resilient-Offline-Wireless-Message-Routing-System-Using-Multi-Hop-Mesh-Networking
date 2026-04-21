@@ -67,7 +67,7 @@ interface UseMeshResult {
   isScanning: boolean;
   myNodeId: string;
   myDisplayName: string;
-  sendMessage: (text: string, destinationId?: string) => Promise<void>;
+  sendMessage: (text: string, destinationId?: string) => Promise<'meshtastic' | 'phone-mesh' | 'queued'>;
   startDiscovery: () => void;
   stopDiscovery: () => void;
   connectToNode: (nodeId: string) => Promise<boolean>;
@@ -155,6 +155,9 @@ export function useMesh(): UseMeshResult {
       // is somehow re-entered (e.g. rapid relay echo), it's immediately blocked.
       _processedMids.add(raw.mid);
       msgsSlice.dispatch(msgsSlice.addSeenId(raw.mid));
+      // Also pre-mark at the service level so duplicate chunks arriving from
+      // parallel relay paths are dropped before entering the chunk buffer.
+      getPhoneMeshService().markMessageSeen(raw.mid);
 
       // Resolve sender display name — read through ref so we always get the
       // latest nearbyNodes list, even if the presence beacon arrived after
@@ -179,19 +182,37 @@ export function useMesh(): UseMeshResult {
 
       if (!isExpired(msg) && msg.hops <= MAX_HOPS) {
         msgsSlice.dispatch(msgsSlice.addMessageAsync(msg));
-        // Notify user — single vibration + notification panel entry
         showMessageNotification(sourceName, msg.payload).catch(() => {});
-        // NOTE: We intentionally do NOT re-broadcast via BLE advertisement here.
-        // Re-broadcasting received phone-mesh messages creates a relay loop:
-        //   Phone A sends → Phone B receives → Phone B re-broadcasts →
-        //   Phone A receives its own message back as "Peer-XXXX" with hops+1.
-        // Since each phone already advertises its OWN messages directly, and any
-        // phone in direct range will receive them, re-relaying via advertisement
-        // only causes duplicates and echo without adding real multi-hop value.
-        // Multi-hop relay to ESP32 nodes (GATT) is kept below.
-        // Relay to any connected ESP32 nodes
-        transmitToAllNodes(msg);
-        // Increment relay count for the source node so the Nodes screen shows it
+
+        // Step 1: Try to deliver to any nearby Meshtastic node (priority path).
+        // This is the goal of the relay chain — once ANY phone in the network
+        // finds a Meshtastic node it hands the message off for LoRa delivery.
+        const meshtasticNodes = nearbyNodesRef.current.filter(n => n.type === 'meshtastic');
+        const connectedMeshtastic = meshtasticNodes.filter(n =>
+          nodesSlice.connectedNodeIds.includes(n.node_id),
+        );
+        if (connectedMeshtastic.length > 0) {
+          transmitToAllNodes(msg);
+          console.log('[Mesh] Relayed phone-mesh message to Meshtastic node (LoRa)');
+        } else if (meshtasticNodes.length > 0) {
+          // Auto-connect to nearest Meshtastic node and forward
+          const nearest = meshtasticNodes.sort((a, b) => b.rssi - a.rssi)[0];
+          ble.connectToNode(nearest.node_id).then(connected => {
+            if (connected) {
+              ble.sendToNode(nearest.node_id, JSON.stringify(messageToPacket(msg)));
+              console.log(`[Mesh] Relayed phone-mesh message to Meshtastic ${nearest.name} (LoRa)`);
+            }
+          });
+        }
+
+        // Step 2: Re-broadcast to other phones so the relay chain continues
+        // toward phones that may be in range of a Meshtastic node.
+        // The 3-layer dedup (_processedMids + seenIds + service seenMids)
+        // guarantees each phone processes each message_id exactly once, so
+        // enabling re-broadcast does NOT create infinite loops.
+        const relayPacket = messageToPacket(msg);
+        getPhoneMeshService().broadcastMessage(relayPacket).catch(() => {});
+
         if (peerNode) {
           nodesSlice.dispatch(nodesSlice.incrementRelayCount(peerNode.node_id));
         }
@@ -264,10 +285,10 @@ export function useMesh(): UseMeshResult {
   // ─── Compose and Send ──────────────────────────────────────────────────────
 
   const sendMessage = useCallback(
-    async (text: string, destinationId = '*') => {
+    async (text: string, destinationId = '*'): Promise<'meshtastic' | 'phone-mesh' | 'queued'> => {
       if (!nodesSlice.myNodeId) {
         console.warn('[Mesh] myNodeId not ready');
-        return;
+        return 'queued';
       }
 
       const msg: Message = {
@@ -308,34 +329,62 @@ export function useMesh(): UseMeshResult {
       const packet = messageToPacket(msg);
       let broadcastOk = false;
 
-      // Channel 1: Broadcast via BLE advertisement (phone-to-phone)
-      // This works connectionlessly — no GATT needed
-      try {
-        const phoneMesh = getPhoneMeshService();
-        await phoneMesh.broadcastMessage(packet);
-        console.log('[Mesh] Message broadcast via BLE advertisement');
-        broadcastOk = true;
-        // Mark as sent — the message was broadcast via BLE advertising
-        msgsSlice.dispatch(msgsSlice.updateStatusAsync({ id: msg.message_id, status: 'sent' }));
-      } catch (err) {
-        console.warn('[Mesh] BLE broadcast failed:', err);
-      }
+      // Priority 1: Deliver via Meshtastic node (BLE GATT → LoRa)
+      // Check if any Meshtastic node is currently connected or visible.
+      // Prefer connected nodes; if none connected, attempt to auto-connect
+      // the nearest (strongest RSSI) Meshtastic node we can see.
+      const meshtasticNodes = nearbyNodesRef.current.filter(n => n.type === 'meshtastic');
+      const connectedMeshtastic = meshtasticNodes.filter(n =>
+        nodesSlice.connectedNodeIds.includes(n.node_id),
+      );
 
-      // Channel 2: Also send to connected ESP32 nodes via GATT (if any)
-      if (nodesSlice.connectedNodeIds.length > 0) {
+      if (connectedMeshtastic.length > 0) {
+        // Already connected — send directly
         const sentViaGATT = await transmitToAllNodes(msg);
         if (sentViaGATT) {
           broadcastOk = true;
           msgsSlice.dispatch(msgsSlice.updateStatusAsync({ id: msg.message_id, status: 'sent' }));
+          console.log('[Mesh] Message delivered via Meshtastic GATT (LoRa)');
+          return 'meshtastic';
+        }
+      } else if (meshtasticNodes.length > 0) {
+        // Not connected yet — auto-connect to strongest Meshtastic node
+        const nearest = meshtasticNodes.sort((a, b) => b.rssi - a.rssi)[0];
+        console.log(`[Mesh] Auto-connecting to Meshtastic node: ${nearest.name}`);
+        const connected = await ble.connectToNode(nearest.node_id);
+        if (connected) {
+          const sentViaGATT = await ble.sendToNode(nearest.node_id, JSON.stringify(packet));
+          if (sentViaGATT) {
+            broadcastOk = true;
+            msgsSlice.dispatch(msgsSlice.updateStatusAsync({ id: msg.message_id, status: 'sent' }));
+            console.log('[Mesh] Message delivered via Meshtastic GATT (LoRa) after auto-connect');
+            return 'meshtastic';
+          }
         }
       }
 
-      // Only queue for later if NO channel succeeded at all
+      // Priority 2 (fallback): No Meshtastic node reachable — broadcast via
+      // BLE advertisement so nearby phones can relay further toward a node.
+      if (!broadcastOk) {
+        try {
+          const phoneMesh = getPhoneMeshService();
+          await phoneMesh.broadcastMessage(packet);
+          console.log('[Mesh] No Meshtastic node found — broadcast via phone mesh');
+          broadcastOk = true;
+          msgsSlice.dispatch(msgsSlice.updateStatusAsync({ id: msg.message_id, status: 'sent' }));
+          return 'phone-mesh';
+        } catch (err) {
+          console.warn('[Mesh] BLE broadcast failed:', err);
+        }
+      }
+
+      // Queue for retry if nothing worked
       if (!broadcastOk) {
         msgsSlice.dispatch(msgsSlice.enqueueMessageAsync({ ...msg, status: 'pending' }));
       }
+      return 'queued';
     },
-    [nodesSlice.myNodeId, nodesSlice.myDisplayName, nodesSlice.connectedNodeIds],
+    [nodesSlice.myNodeId, nodesSlice.myDisplayName, nodesSlice.connectedNodeIds, ble.connectToNode, ble.sendToNode],
   );
 
   // ─── Transmit via GATT to all connected ESP32 nodes ────────────────────────
@@ -391,6 +440,7 @@ export function useMesh(): UseMeshResult {
 
         _processedMids.add(packet.mid);
         msgsSlice.dispatch(msgsSlice.addSeenId(packet.mid));
+        getPhoneMeshService().markMessageSeen(packet.mid);
 
         const msg = packetToMessage(packet);
         if (isExpired(msg) || msg.hops > MAX_HOPS) return;

@@ -1,9 +1,9 @@
 /**
  * MeshNodeType distinguishes between two kinds of network participants:
- * - ble-phone:   Another phone running this app, reachable via BLE
- * - esp32-lora:  An ESP32 hardware node that bridges BLE ↔ LoRa radio
+ * - ble-phone:   Another phone running this app, reachable via BLE advertising
+ * - meshtastic:  A Meshtastic node (ESP32+LoRa) bridging BLE ↔ LoRa radio
  */
-export type MeshNodeType = 'ble-phone' | 'esp32-lora';
+export type MeshNodeType = 'ble-phone' | 'meshtastic';
 
 /**
  * Represents a discovered node in the mesh network.
@@ -19,7 +19,7 @@ export interface MeshNode {
   /** Received Signal Strength Indicator in dBm (e.g. -70) */
   rssi: number;
 
-  /** Whether this is a phone peer or an ESP32 LoRa gateway */
+  /** Whether this is a phone peer or a Meshtastic LoRa gateway */
   type: MeshNodeType;
 
   /** Unix timestamp ms of last BLE advertisement seen */

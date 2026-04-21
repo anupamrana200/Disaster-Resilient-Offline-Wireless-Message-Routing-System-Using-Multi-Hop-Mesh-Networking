@@ -15,15 +15,15 @@ import type { DeviceFoundCallback, MessageReceivedCallback, DisconnectCallback }
 const FAKE_DEVICES = [
   {
     id: 'esp32-node-001',
-    name: 'ESP32-LoRa-001',
+    name: 'Meshtastic_c8d0',
     rssi: -58,
-    type: 'esp32-lora' as const,
+    type: 'meshtastic' as const,
   },
   {
     id: 'esp32-node-002',
-    name: 'ESP32-LoRa-002',
+    name: 'Meshtastic_8c7c',
     rssi: -74,
-    type: 'esp32-lora' as const,
+    type: 'meshtastic' as const,
   },
   {
     id: 'phone-peer-abc',

@@ -53,7 +53,7 @@ export default function NodesScreen() {
   };
 
   const phonePeers = nearbyNodes.filter(n => n.type === 'ble-phone').length;
-  const espNodes = nearbyNodes.filter(n => n.type === 'esp32-lora').length;
+  const espNodes = nearbyNodes.filter(n => n.type === 'meshtastic').length;
   const totalRelayed = nearbyNodes.reduce((sum, n) => sum + n.relay_count, 0);
 
   return (
@@ -68,7 +68,7 @@ export default function NodesScreen() {
         {/* Stats Row */}
         <View style={styles.statsRow}>
           <StatBox label="📱 Phones" value={phonePeers} color="#60b4ff" />
-          <StatBox label="📻 ESP32" value={espNodes} color="#ff9f0a" />
+          <StatBox label="📡 Meshtastic" value={espNodes} color="#ff9f0a" />
           <StatBox label="↷ Relayed" value={totalRelayed} color="#00c896" />
         </View>
 

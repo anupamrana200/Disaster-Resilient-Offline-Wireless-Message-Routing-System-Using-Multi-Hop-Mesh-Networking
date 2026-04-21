@@ -9,7 +9,7 @@
  *   - Initializes device identity and BLE on mount
  */
 
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
 import {
   View,
   FlatList,
@@ -18,6 +18,7 @@ import {
   SafeAreaView,
   KeyboardAvoidingView,
   Platform,
+  Animated,
 } from 'react-native';
 import { LinearGradient } from 'expo-linear-gradient';
 import { useNodeId } from '@/hooks/useNodeId';
@@ -40,6 +41,8 @@ function resolveSenderName(msg: Message, nearbyNodes: MeshNode[]): string {
   return peer?.name || msg.source_name;
 }
 
+type RouteToast = { message: string; color: string } | null;
+
 export default function ChatScreen() {
   const { deviceId, displayName: myDisplayName, isReady: nodeReady } = useNodeId();
   const {
@@ -56,6 +59,32 @@ export default function ChatScreen() {
   const totalMeshPeers = connectedNodeIds.length + phonepeersCount;
 
   const listRef = useRef<FlatList<Message>>(null);
+
+  // ─── Route toast ───────────────────────────────────────────────────────────
+  const [routeToast, setRouteToast] = useState<RouteToast>(null);
+  const toastOpacity = useRef(new Animated.Value(0)).current;
+  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const showRouteToast = useCallback((route: 'meshtastic' | 'phone-mesh' | 'queued') => {
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+    const config: Record<typeof route, RouteToast> = {
+      meshtastic: { message: '📡 Sent via Meshtastic (LoRa)', color: '#ff9f0a' },
+      'phone-mesh': { message: '📱 Broadcasting via phone mesh', color: '#60b4ff' },
+      queued:       { message: '⏳ Queued — no nodes nearby', color: '#ff453a' },
+    };
+    setRouteToast(config[route]);
+    toastOpacity.setValue(0);
+    Animated.sequence([
+      Animated.timing(toastOpacity, { toValue: 1, duration: 200, useNativeDriver: true }),
+      Animated.delay(2200),
+      Animated.timing(toastOpacity, { toValue: 0, duration: 300, useNativeDriver: true }),
+    ]).start(() => setRouteToast(null));
+  }, [toastOpacity]);
+
+  const handleSend = useCallback(async (text: string) => {
+    const route = await sendMessage(text);
+    showRouteToast(route);
+  }, [sendMessage, showRouteToast]);
 
   // Scanning starts automatically inside useMesh once BLE is ready.
 
@@ -181,8 +210,15 @@ export default function ChatScreen() {
           />
 
           {/* Input Bar */}
-          <ChatInput onSend={sendMessage} disabled={!nodeReady} />
+          <ChatInput onSend={handleSend} disabled={!nodeReady} />
         </KeyboardAvoidingView>
+
+        {/* Route toast — shows which channel was used after sending */}
+        {routeToast && (
+          <Animated.View style={[styles.routeToast, { opacity: toastOpacity, borderColor: routeToast.color }]}>
+            <Text style={[styles.routeToastText, { color: routeToast.color }]}>{routeToast.message}</Text>
+          </Animated.View>
+        )}
       </LinearGradient>
     </SafeAreaView>
   );
@@ -282,6 +318,21 @@ const styles = StyleSheet.create({
   separatorLabel: {
     fontSize: 11,
     color: 'rgba(255,255,255,0.4)',
+    fontFamily: 'OpenSans-Semibold',
+  },
+  // ─── Route Toast ─────────────────────────────────────────────────────────
+  routeToast: {
+    position: 'absolute',
+    bottom: 90,
+    alignSelf: 'center',
+    backgroundColor: '#0d1117',
+    borderWidth: 1,
+    borderRadius: 20,
+    paddingHorizontal: 18,
+    paddingVertical: 9,
+  },
+  routeToastText: {
+    fontSize: 13,
     fontFamily: 'OpenSans-Semibold',
   },
   // ─── Empty State ──────────────────────────────────────────────────────────
