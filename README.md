@@ -1,300 +1,242 @@
-<h1 align="center">
-  <img src='https://github.com/wataru-maeda/react-native-boilerplate/blob/main/__DELELE_ME__/banner.png' width='600'>
-</h1>
+# DisasterMesh
 
-<p align="center">
-  <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="React Native is released under the MIT license." />
-  <img src="https://github.com/wataru-maeda/react-native-boilerplate/actions/workflows/preview.yml/badge.svg" alt="" />
-  <img src="https://github.com/wataru-maeda/react-native-boilerplate/actions/workflows/test.yml/badge.svg" alt="" />
-  <img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs welcome!" />
-</p>
+**Disaster-Resilient Offline Wireless Message Routing System Using Multi-Hop Mesh Networking**
 
-<p align="center">
-  <img src='https://github.com/wataru-maeda/react-native-boilerplate/blob/main/__DELELE_ME__/demo-light-theme.gif' width='150px'>
-  <img src='https://github.com/wataru-maeda/react-native-boilerplate/blob/main/__DELELE_ME__/demo-dark-theme.gif' width='150px'>
-</p>
+A mobile application that enables text communication in disaster scenarios where traditional internet and cellular infrastructure has failed. It works entirely offline using Bluetooth Low Energy (BLE) to form a peer-to-peer mesh network between phones, with optional LoRa long-range radio via Meshtastic devices.
 
-Say goodbye to time-consuming setup tasks like restructuring files, installing libraries, and crafting reusable components. Our project boilerplate is your solution to eliminate redundant work when starting from scratch. Built with the latest Expo SDK 54, React 19.1, and modern development practices, it includes only the most commonly-used libraries, so you can hit the ground running with a fully configured setup.
-
-## 🎯 Pre-configured Features
-
-- 📱 **Expo SDK 54** with React 19.1 and React Native 0.81.4
-- 🏗️ **New Architecture** enabled by default for optimal performance
-- 🧭 **Expo Router v6** with flat config for file-based routing
-- 🎨 **Light/Dark theme** support with automatic detection
-- 🔄 **Redux Toolkit** for predictable state management
-- 📦 **Environment configuration** with dotenvx for dev/staging/prod
-- 🚀 **CI/CD workflows** with EAS Build and Preview channels
-- 🛠️ **Modern tooling**: ESLint 9 (flat config), Prettier, Jest
-- 🌐 **Multi-platform**: iOS, Android, and Web distribution
-- 📝 **AI-friendly**: Claude.md and Cursor rules for AI development
-- 🧪 **Testing ready**: React Native Testing Library setup
-- 🔒 **Type-safe**: Strict TypeScript configuration
-
-## 🗒️ Requirements
-
-- [Node: 20.x or higher](https://nodejs.org/en)
-- [Expo CLI](https://docs.expo.dev/more/expo-cli/)
-- [EAS CLI](https://docs.expo.dev/build/setup/) (for builds and deployment)
-
-## 🚀 Quick Start
-
-1. Download zip or click "Use this template"
-2. Install packages with `npm install` or `yarn install`
-3. Spin up dev environment with `npm run dev` or `yarn run dev`
-
-## 🤖 What's included
-
-<details>
-  <summary><b>File-based Router</b></summary>
-  
-####
-
-The project uses [**Expo Router**](https://docs.expo.dev/router/introduction/) with a pre-configured navigation structure which has updated from react-navigation. The navigation structure is based on file-based routing, making it easier to manage and navigate between screens. The project has a pre-configured navigation structure with a drawer and tab navigation. You can easily add new screens and navigations by following the existing structure:
-
-```
-Root (Drawer)
-├── Home Tab
-│   └── Stack
-│       ├── Home Screen
-│       └── Details Screen
-└── Profile Tab
-    └── Stack
-        ├── Profile Screen
-        └── Details Screen
-```
-
-</details>
-
-<details>
-  <summary><b>Global State Management</b></summary>
-
-####
-
-### State Management with Redux Toolkit
 ---
 
-This project uses [**Redux Toolkit**](https://redux-toolkit.js.org/) for global state management, pre-configured with Redux Hooks for immediate use. 
+## How It Works
 
-#### Getting Started
-1. Explore existing slices in the [`/slices`](https://github.com/wataru-maeda/react-native-boilerplate/tree/main/slices) directory
-2. See usage examples in [`/app/_layout.tsx`](https://github.com/wataru-maeda/react-native-boilerplate/blob/main/app/_layout.tsx#L23)
+Messages travel across a multi-hop mesh network — each phone acts as both a sender and a relay node. If the recipient is out of direct BLE range, intermediate phones automatically forward the message until it reaches the destination (up to 5 hops). When a Meshtastic LoRa device is nearby, the app uses it as a gateway to extend range significantly beyond BLE limits.
 
-#### Adding New State
-1. Copy [`/slices/app.slice.ts`](https://github.com/wataru-maeda/react-native-boilerplate/blob/main/slices/app.slice.ts)
-2. Rename and modify for your needs
-3. Add your slice to [`/utils/store.ts`](https://github.com/wataru-maeda/react-native-boilerplate/blob/main/utils/store.ts#L10)
+```
+Phone A  ──BLE──►  Phone B  ──BLE──►  Meshtastic  ──LoRa──►  Phone C
+(sender)           (relay)            (gateway)               (recipient)
+```
 
-#### Development
-Redux logger is enabled by default. To disable, remove the logger from [`/utils/store.ts`](https://github.com/wataru-maeda/react-native-boilerplate/blob/main/utils/store.ts#L13).
-
-</details>
-
-<details>
-  <summary><b>Theme Management</b></summary>
-
-####
-
-The project simplifies asset and theme management through a centralized [`/theme`](https://github.com/wataru-maeda/react-native-boilerplate/tree/main/theme) directory that handles images, icons, fonts, and colors, with built-in asset preloading and SVG support for optimal performance, while also providing a custom `useColorScheme` hook (located in [`/hooks/useColorScheme.ts`](https://github.com/wataru-maeda/react-native-boilerplate/blob/main/hooks/useColorScheme.ts)) that automatically detects and adapts colors based on the current theme across both mobile and web platforms - making it easy to implement dynamic theming by returning the current color scheme name and flags (isDark, isLight) for conditional styling.
-
-</details>
-
-<details>
-  <summary><b>Environment Variables</b></summary>
-
-####
-
-### Environment Variables Management
 ---
 
-The project uses [`dotenvx`](https://dotenvx.com/) to handle environment variables across both Expo CLI and EAS CLI builds. Here's how it works:
+## Architecture
 
-#### Setup Structure
-- `.env.dev.example` - Development environment template
-- `.env.prod.example` - Production environment template
-- Configuration in [`app.config.ts`](https://github.com/wataru-maeda/react-native-boilerplate/blob/main/app.config.ts) and [`utils/config.ts`](https://github.com/wataru-maeda/react-native-boilerplate/blob/main/utils/config.ts)
+```
+┌─────────────────────────────────────────────────────┐
+│           Chat / Nodes / Settings Screens            │
+├─────────────────────────────────────────────────────┤
+│            useMesh() Hook  (core mesh logic)         │
+├───────────────────────┬─────────────────────────────┤
+│   useBLE Hook         │   PhoneMeshService           │
+│   (GATT connections)  │   (BLE advertisement mesh)   │
+├───────────────────────┼─────────────────────────────┤
+│   react-native-ble-plx│   react-native-ble-advertiser│
+├───────────────────────┴─────────────────────────────┤
+│        Redux Slices: messages · nodes · app          │
+├─────────────────────────────────────────────────────┤
+│              AsyncStorage (persistence)              │
+├─────────────────────────────────────────────────────┤
+│   Physical Layer                                     │
+│   ├─ BLE GATT  ↔  Meshtastic ESP32 (LoRa)           │
+│   └─ BLE Advertising  ↔  Nearby Phones              │
+└─────────────────────────────────────────────────────┘
+```
 
-#### Getting Started with Your Expo Account
-1. Rename `.env.dev.example` to `.env.dev`
-2. Update `owner` in [`app.json`](https://github.com/wataru-maeda/react-native-boilerplate/blob/main/app.json#L6) with your Expo username
-3. Set your `EXPO_SLUG` and `EXPO_PROJECT_ID` in `.env.dev`
+### Data Flow
 
-#### Adding New Environment Variables
-1. Add variables to both `.env.dev` and `.env.prod`
-2. Include them in `app.config.ts` under the [`extra`](https://github.com/wataru-maeda/react-native-boilerplate/blob/main/app.config.ts#L29) object
-3. Define them in [`utils/config.ts`](https://github.com/wataru-maeda/react-native-boilerplate/blob/main/utils/config.ts#L6)
+1. User types a message → `ChatInput` component
+2. `useMesh.sendMessage()` marks the message as seen across 3 dedup layers
+3. **Routing decision:**
+   - Connected Meshtastic nearby → send via GATT (LoRa priority)
+   - Meshtastic in range but not connected → auto-connect, then send
+   - No Meshtastic → broadcast via `PhoneMeshService` (BLE ads)
+4. Receiving phones deduplicate, store, and relay the message onward
+5. All messages persisted to AsyncStorage; TTL-expired messages pruned every 10 seconds
 
-#### Verify Configuration
-- Check variables in the app's bottom sheet OR...
-- Run `npm run dev:config:public` to view loaded variables in console
-
-### Environment Variables & Security
 ---
 
-The project intentionally avoids using `EXPO_PUBLIC_` prefix for environment variables, instead utilizing EAS secrets for enhanced security. Here's why:
+## Transport Layers
 
-#### Current Approach
-- Variables are uploaded to EAS servers as `secrets`
-- Securely accessible only during EAS build and submit processes
-- Use `npm run dev:secret:push` to automatically upload variables from `.env.dev` and `.env.prod`
+### Phone-to-Phone BLE Mesh (`phone-mesh.service.ts`)
+- Messages are chunked into 10-byte payloads and broadcast as BLE manufacturer data packets
+- Each chunk repeated 5× at 400 ms intervals for reliability
+- BLE advertisement format: `[DM header][type][msgId/deviceId][chunk metadata][payload]`
+- Presence beacons advertise device ID + display name so peers appear in the node list
+- Android only (iOS restricts background BLE advertising)
 
-#### Alternative Approach
-If you prefer direct access via `process.env`:
-- Use `EXPO_PUBLIC_` prefix for non-sensitive data
-- **Warning**: Never store sensitive information with `EXPO_PUBLIC_` prefix as it exposes data to clients
-- For sensitive data handling, follow [React Native's security guidelines](https://reactnative.dev/docs/security#storing-sensitive-info) for storing sensitive information
+### Meshtastic LoRa Gateway (`ble.service.ts`)
+- App connects via GATT to ESP32 nodes running Meshtastic firmware
+- Uses hardcoded UUIDs matching the Meshtastic firmware:
+  - Service UUID: `4fafc201-1fb5-459e-8fcc-c5c9c331914b`
+  - TX (phone → ESP32): `beb5483e-36e1-4688-b7f5-ea07361b26a8`
+  - RX (ESP32 → phone): `beb5483e-36e1-4688-b7f5-ea07361b26a9`
+- Compact `MessagePacket` JSON sent over GATT; Meshtastic handles LoRa transmission
 
-</details>
+---
 
-<details>
-  <summary><b>Simplified Distribution</b></summary>
+## Message Routing Logic
 
-####
+- **MAX_HOPS = 5** — prevents infinite relay loops
+- **3-layer deduplication:** module-level `Set` (permanent), service-level `Set`, Redux `seenIds` array
+- **Relay priority:** Meshtastic (LoRa) → phone mesh BLE → pending queue
+- **Pending queue:** messages queued when no nodes are reachable; flushed every 10 seconds
+- **TTL:** default 24 hours, configurable per device; expired messages auto-removed
 
-The project streamlines deployment with simple commands - use `npm run dev:build:mobile` to generate iOS (IPA) and Android (APK) distributions, and `npm run dev:deploy:web` to deploy the web version to EAS Hosting.
+---
 
-</details>
+## Screens
 
-<details>
-  <summary><b>Development and Build Scripts</b></summary>
+### Chat
+WhatsApp-style messaging interface.
+- Real-time message list with auto-scroll
+- Message bubbles: own messages right-aligned (teal), others left-aligned (dark)
+- Shows sender name, timestamp, delivery status, and hop count (↷)
+- Connectivity status banner with blinking indicator and pending message count
+- Keyboard-aware sticky input bar (max 400 characters)
+- Toast notification showing which route a message used (Meshtastic / phone-mesh / queued)
 
-####
+### Nodes
+BLE discovery and connection management.
+- Animated radar visualization during scanning
+- Node list with type icon (phone or Meshtastic), RSSI signal bars (5-level), last-seen time, relay count
+- Connect / disconnect controls for Meshtastic devices
+- Live stats: connected node count, total discovered, total relayed
 
-#### Development:
-- `npm run dev` - Run on all platforms
-- `npm run dev:ios` - Run iOS only
-- `npm run dev:android` - Run Android only
-- `npm run dev:web` - Run web only
+### Settings
+Device identity and configuration.
+- Set and edit display name (persisted across restarts via UUID)
+- Configure message TTL (preset or custom duration)
+- Storage management and data reset
 
-#### Building:
-- `npm run dev:build:mobile` - Build mobile apps
-- `npm run dev:build:web` - Build web app
-- `npm run dev:deploy:web` - Deploy web app to [EAS Hosting](https://docs.expo.dev/eas/hosting/introduction/)
+---
 
-#### Testing:
-- `npm run lint` - Run ESLint
-- `npm run format` - Run Prettier
-- `npm run test` - Run Jest tests
+## Key Files
 
-</details>
+| File | Purpose |
+|---|---|
+| `hooks/useMesh.ts` | Core mesh networking: routing, relay, dedup, dual transport |
+| `hooks/useBLE.ts` | BLE scanning, GATT connections, Meshtastic discovery |
+| `hooks/useNodeId.ts` | Stable device UUID generation and persistence |
+| `services/phone-mesh.service.ts` | Phone-to-phone BLE advertisement broadcasting |
+| `services/ble.service.ts` | Meshtastic GATT wrapper |
+| `services/storage.service.ts` | AsyncStorage with TTL, dedup, JSON serialization |
+| `slices/messages.slice.ts` | Message state (history, pending queue, dedup cache) |
+| `slices/nodes.slice.ts` | Node discovery state (nearby nodes, connections) |
+| `types/message.ts` | `Message`, `MessagePacket`, `MessageStatus` types |
+| `types/node.ts` | `MeshNode`, `LocalDevice`, `MeshNodeType` types |
+| `app/(main)/(tabs)/chat/` | Chat screen route |
+| `app/(main)/(tabs)/nodes/` | Nodes screen route |
+| `app/(main)/(tabs)/settings/` | Settings screen route |
 
-<details>
-  <summary><b>Code formatting, linting and testing on pre-commit</b></summary>
+---
 
-####
+## Message Data Model
 
-The project maintains code quality through integrated Eslint, Prettier, and Jest configurations - code is automatically scanned and formatted during development (especially with 'Format on Save' enabled), while pre-commit hooks verify, format, and test your code to ensure all commits meet quality standards.
-
-</details>
-
-<details>
-  <summary><b>Release preview channel on Pull-Request (only mobile)</b></summary>
-
-####
-
-- When you've completed your work and need to share a preview with the QA team, our boilerplate automates the distribution process for you. Here's how it works:
-1. Whenever you create a pull request (PR) or merge, it automatically generates a preview channel in your Expo account.
-2. You don't need to run 'eas' commands every time you create a PR; the process is streamlined for you.
-3. The continuous delivery (CD) process is managed through the [preview.yml](https://github.com/wataru-maeda/react-native-boilerplate/blob/main/.github/workflows/preview.yml) configuration file, which utilizes [expo-github-action](https://github.com/expo/expo-github-action).
-
-To set up the CD workflow, follow these steps:
-1. Create an `EXPO_TOKEN` in your Expo account. You can do this by visiting [this link](https://expo.dev/accounts/%5Baccount%5D/settings/access-tokens).
-2. In your GitHub repository, go to **Settings**, then navigate to **Secrets and variables** -> **Actions** -> **Add new repository secret**. Make sure to name the secret as `EXPO_TOKEN`.
-3. Update `name`, `slug`, `owner`, `projectId` and `url` in [app.json](https://github.com/wataru-maeda/react-native-boilerplate/blob/main/app.json):
-4. Update in `name`, `slug`, `projectId`, `ios`, `android` in [app.config.ts](https://github.com/wataru-maeda/react-native-boilerplate/blob/main/app.config.ts)
-6. After you push changes to the main branch, a new preview will be created automatically.
-
-</details>
-
-## 🔧 Available Scripts
-
-The project includes comprehensive development, building, testing, and deployment scripts to streamline your workflow.
-
-<details>
-  <summary><b>Development Commands</b></summary>
-
-####
-
-- `npm run dev` - Start Expo development server for all platforms with cache cleared
-- `npm run dev:ios` - Start development server for iOS simulator only
-- `npm run dev:android` - Start development server for Android emulator only  
-- `npm run dev:web` - Start development server for web browser only
-- `npm run dev:doctor` - Run Expo diagnostics to check project health
-
-</details>
-
-<details>
-  <summary><b>Building & Deployment</b></summary>
-
-####
-
-- `npm run dev:build:mobile` - Build iOS (IPA) and Android (APK) using EAS Build for development
-- `npm run dev:build:web` - Export static web application to `dist/` directory
-- `npm run dev:serve:web` - Serve the built web app locally (run after `dev:build:web`)
-- `npm run dev:deploy:web` - Build and deploy web app to [EAS Hosting](https://docs.expo.dev/eas/hosting/introduction/)
-
-</details>
-
-<details>
-  <summary><b>Environment & Configuration</b></summary>
-
-####
-
-- `npm run dev:secret:push` - Upload environment variables from `.env.dev` to EAS secrets
-- `npm run dev:secret:list` - List all environment variables stored in EAS
-- `npm run dev:config:public` - Display current Expo configuration for debugging
-
-</details>
-
-<details>
-  <summary><b>Code Quality & Testing</b></summary>
-
-####
-
-- `npm run lint` - Run ESLint to check code quality and style
-- `npm run lint:staged` - Run linting only on staged Git files (used in pre-commit)
-- `npm run format` - Format code using Prettier
-- `npm run test` - Run Jest unit tests
-- `npm run test:watch` - Run Jest tests in watch mode for development
-- `npm run prepare` - Set up Husky Git hooks for pre-commit quality checks
-
-</details>
-
-<details>
-  <summary><b>Common Usage Examples</b></summary>
-
-####
-
-**Start development:**
-```bash
-npm run dev                    # All platforms
-npm run dev:web               # Web only
+```typescript
+interface Message {
+  message_id: string;        // UUID v4
+  source_id: string;         // sender device UUID
+  destination_id: string;    // recipient UUID or '*' for broadcast
+  source_name: string;       // display name of sender
+  payload: string;           // message text
+  timestamp: number;         // Unix ms
+  ttl: number;               // seconds until expiry
+  status: MessageStatus;     // pending | sent | delivered | relayed | expired
+  hops: number;              // relay hop count
+}
 ```
 
-**Build and deploy web:**
-```bash
-npm run dev:build:web         # Build static files
-npm run dev:serve:web         # Test locally
-npm run dev:deploy:web        # Deploy to EAS Hosting
+Wire format (`MessagePacket`) is a compact JSON with short keys (`mid`, `src`, `dst`, `sn`, `pay`, `ts`, `ttl`, `hops`) to minimise BLE payload size.
+
+---
+
+## Node Data Model
+
+```typescript
+interface MeshNode {
+  node_id: string;           // UUID v4
+  name: string;              // display name
+  rssi: number;              // signal strength in dBm
+  type: 'ble-phone' | 'meshtastic';
+  last_seen: number;         // Unix ms
+  is_connected: boolean;
+  relay_count: number;       // messages relayed through this node
+}
 ```
 
-**Code quality:**
-```bash
-npm run lint                  # Check code
-npm run format               # Format code
-npm run test                 # Run tests
+---
+
+## Tech Stack
+
+| Layer | Technology |
+|---|---|
+| Framework | React Native + Expo SDK 54 |
+| Language | TypeScript (strict mode) |
+| Navigation | Expo Router v6 (file-based) |
+| State | Redux Toolkit |
+| BLE (GATT) | react-native-ble-plx |
+| BLE (Advertising) | react-native-ble-advertiser |
+| Storage | AsyncStorage |
+| Notifications | expo-notifications |
+| UI | StyleSheet + custom dark theme |
+
+---
+
+## Android Permissions Required
+
+```
+BLUETOOTH, BLUETOOTH_ADMIN
+BLUETOOTH_SCAN, BLUETOOTH_CONNECT, BLUETOOTH_ADVERTISE
+ACCESS_FINE_LOCATION, ACCESS_COARSE_LOCATION
+FOREGROUND_SERVICE, RECEIVE_BOOT_COMPLETED
 ```
 
-</details>
+BLE PLX is configured with background mode enabled (peripheral + central) so messages can be received when the app is backgrounded.
 
-## ☀️ Icons
+---
 
-Expo provides a popular set of vector icons. Please search icons from [here](https://icons.expo.fyi/)
+## Getting Started
 
-## 🧑‍💻 Need native code?
+### Prerequisites
+- Node 20.x or higher
+- Expo CLI
+- Android device (BLE advertising required; iOS has background advertising restrictions)
+- Optional: Meshtastic ESP32 device for LoRa range extension
 
-To generate iOS and Android native code, you can run `npx expo prebuild` in the project's root directory. For more details and specific instructions, please refer to the [Expo documentation page](https://docs.expo.dev/workflow/prebuild/).
+### Setup
 
-## 📓 License
+```bash
+# Install dependencies
+npm install
 
-This project is available under the MIT license. See the [LICENSE](https://github.com/wataru-maeda/react-native-boilerplate/blob/main/LICENSE) file for more info.
+# Start development server
+npm run dev:android
+```
+
+### Available Scripts
+
+| Command | Description |
+|---|---|
+| `npm run dev` | Start Expo dev server (all platforms) |
+| `npm run dev:android` | Start for Android only |
+| `npm run dev:ios` | Start for iOS only |
+| `npm run dev:build:mobile` | Build APK + IPA via EAS |
+| `npm run lint` | Run ESLint |
+| `npm run format` | Run Prettier |
+| `npm run test` | Run Jest tests |
+
+---
+
+## Disaster Scenario Usage
+
+1. **No infrastructure needed** — app works with only Bluetooth enabled
+2. **Launch app** on multiple Android devices
+3. Go to **Nodes** tab — devices will auto-discover each other via BLE scan
+4. Go to **Chat** tab — send a broadcast message (`*`) to reach all nodes
+5. Each device in range automatically **relays** the message further
+6. If a **Meshtastic** device is nearby, connect to it in the Nodes tab for LoRa range (km-scale)
+7. Messages are stored locally and retried — they survive temporary disconnections
+
+---
+
+## License
+
+MIT
