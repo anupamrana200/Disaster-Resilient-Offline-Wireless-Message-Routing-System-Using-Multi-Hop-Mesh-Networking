@@ -115,6 +115,15 @@ class PhoneMeshService {
    */
   private seenMids: Set<string> = new Set();
 
+  /**
+   * Set of 4-char srcIdHex prefixes that belong to THIS device. Populated
+   * automatically by broadcastMessage() and by setMyIdentity(). Any incoming
+   * chunk whose srcIdHex is in this set is our own packet echoed back by a
+   * relay or by the Android <=11 self-scan. Used as the most reliable
+   * own-message guard — works even when setMyIdentity() was never called.
+   */
+  private myOwnSrcIds: Set<string> = new Set();
+
   /** Callback when a message is fully reassembled */
   private onMessageReassembled: ((raw: Partial<MessagePacket>) => void) | null = null;
 
@@ -140,10 +149,23 @@ class PhoneMeshService {
   /**
    * Store this device's own identity so the presence beacon can be
    * automatically restarted after message chunk broadcasting finishes.
+   * Also registers the 4-char srcIdHex prefix so incoming echoes of our
+   * own messages are dropped at the earliest possible point.
    */
   setMyIdentity(deviceId: string, displayName: string): void {
     this.myDeviceId = deviceId;
     this.myDisplayName = displayName;
+    const shortSrc = deviceId.replace(/-/g, '').slice(0, 4).toLowerCase();
+    if (shortSrc) this.myOwnSrcIds.add(shortSrc);
+  }
+
+  /**
+   * Check whether a 4-char srcIdHex belongs to this device. Used by the
+   * BLE scan listener to drop self-echoed chunks before any buffering.
+   */
+  isOwnSrcId(srcIdHex: string): boolean {
+    if (!srcIdHex) return false;
+    return this.myOwnSrcIds.has(srcIdHex.toLowerCase());
   }
 
   /**
@@ -339,6 +361,20 @@ class PhoneMeshService {
     const msgIdBytes = hexToBytes(packet.mid.replace(/-/g, ''), 4);
     const srcIdBytes = hexToBytes(packet.src.replace(/-/g, ''), 2);
 
+    // Failsafe self-identification: the exact bytes we are about to put on
+    // the air are the bytes that come back when a relay echoes us. Register
+    // them now so the echo is recognized even if setMyIdentity() was never
+    // called (e.g. sender relays a message whose src is another phone's id).
+    const outgoingSrcHex = srcIdBytes.map(b => b.toString(16).padStart(2, '0')).join('');
+    const outgoingMidHex = msgIdBytes.map(b => b.toString(16).padStart(2, '0')).join('');
+    this.seenMids.add(outgoingMidHex);
+    // Only register the srcId prefix as "ours" if it matches our stored
+    // identity — never mark relay packets (src=original sender) as own.
+    if (this.myDeviceId) {
+      const myShort = this.myDeviceId.replace(/-/g, '').slice(0, 4).toLowerCase();
+      if (myShort === outgoingSrcHex) this.myOwnSrcIds.add(myShort);
+    }
+
     console.log(`[PhoneMesh] Broadcasting message: ${totalChunks} chunks, payload: "${packet.pay}"`);
 
     // Build one copy of each unique chunk advertisement
@@ -471,6 +507,16 @@ class PhoneMeshService {
     //   • Relay echo: a peer relays our message back and we receive it again
     // Must be first because seenMids may be transiently empty (fresh restart,
     // cleared by destroy(), or pre-mark not yet flushed).
+    //
+    // Two-layer own-id check:
+    //   1. myOwnSrcIds — populated by setMyIdentity() + broadcastMessage().
+    //      Catches the case where the identity was set at any point in the
+    //      session, even if myDeviceId gets transiently cleared.
+    //   2. myDeviceId direct comparison — belt-and-braces fallback.
+    if (this.myOwnSrcIds.has(chunk.srcIdHex.toLowerCase())) {
+      console.log(`[PhoneMesh] Dropping own message chunk via myOwnSrcIds (src=${chunk.srcIdHex})`);
+      return;
+    }
     if (this.myDeviceId) {
       const myShortId = this.myDeviceId.replace(/-/g, '').slice(0, 4).toLowerCase();
       if (chunk.srcIdHex.toLowerCase() === myShortId) {
@@ -602,6 +648,7 @@ class PhoneMeshService {
     this.lastMessageChunks = [];
     this.chunkBuffers.clear();
     this.seenMids.clear();
+    this.myOwnSrcIds.clear();
   }
 }
 

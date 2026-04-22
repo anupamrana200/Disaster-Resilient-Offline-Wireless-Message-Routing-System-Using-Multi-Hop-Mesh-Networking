@@ -130,7 +130,15 @@ export function useMesh(): UseMeshResult {
     phoneMesh.setMessageCallback((raw: Partial<MessagePacket>) => {
       if (!raw.mid || !raw.pay) return;
 
-      // Layer 1 — own-message filter (FIRST — most reliable, restart-proof).
+      // Layer 0 — service-level own-source check. PhoneMeshService tracks the
+      // 4-char srcIdHex of every outgoing broadcast from this device, so this
+      // catches echoes even if myNodeIdRef.current is transiently empty.
+      if (getPhoneMeshService().isOwnSrcId?.(raw.src ?? '')) {
+        console.log(`[Mesh] Dropping own-echo message via isOwnSrcId (src=${raw.src})`);
+        return;
+      }
+
+      // Layer 1 — own-message filter (compare against current node ID).
       // raw.src is the originator's srcIdHex (first 4 hex chars of their UUID,
       // encoded as 2 bytes in the BLE advertisement packet). We compare it
       // against the same 4-char prefix of our own UUID. If they match, this
@@ -142,7 +150,10 @@ export function useMesh(): UseMeshResult {
       const myId = myNodeIdRef.current;
       if (myId) {
         const myShortId = myId.replace(/-/g, '').slice(0, 4).toLowerCase();
-        if ((raw.src ?? '').toLowerCase() === myShortId) return;
+        if ((raw.src ?? '').toLowerCase() === myShortId) {
+          console.log(`[Mesh] Dropping own-echo message via myNodeIdRef (src=${raw.src})`);
+          return;
+        }
       }
 
       // Layer 2 — module-level permanent Set (fast dedup for all other msgs).
@@ -167,6 +178,16 @@ export function useMesh(): UseMeshResult {
         n.node_id.replace('phone-', '').startsWith(srcHex),
       );
       const sourceName = peerNode?.name || `Peer-${srcHex.slice(0, 4)}`;
+
+      // Hard filter: reject any message whose resolved sender name is the
+      // fallback "Peer-xxxx". A real peer always announces via presence beacon
+      // first, so a "Peer-" name means we have no node record for this srcId
+      // — overwhelmingly this is our own message echoed by a relay while the
+      // identity guard was momentarily blind. Drop without UI side effects.
+      if (sourceName.startsWith('Peer-')) {
+        console.log(`[Mesh] Dropping message with unknown sender "${sourceName}" (src=${srcHex})`);
+        return;
+      }
 
       const msg: Message = {
         message_id: raw.mid,
@@ -321,7 +342,13 @@ export function useMesh(): UseMeshResult {
       _processedMids.add(msg.message_id.toLowerCase());
       _processedMids.add(msg.message_id); // also add original in case ref is stored
       msgsSlice.dispatch(msgsSlice.addSeenId(shortMid));
-      getPhoneMeshService().markMessageSeen(shortMid);
+      // Guarantee the service knows our identity + the outgoing msgId before
+      // any chunk goes out. This is what makes the own-echo guard bulletproof
+      // even when the useEffect that normally sets identity has not run yet
+      // (e.g. first-send right after app start).
+      const pm = getPhoneMeshService();
+      pm.setMyIdentity?.(nodesSlice.myNodeId, nodesSlice.myDisplayName);
+      pm.markMessageSeen(shortMid);
 
       // Optimistically add to local history
       await msgsSlice.dispatch(msgsSlice.addMessageAsync(msg));

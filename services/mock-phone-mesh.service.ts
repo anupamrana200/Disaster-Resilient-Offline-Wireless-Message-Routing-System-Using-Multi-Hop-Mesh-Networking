@@ -27,6 +27,16 @@ class MockPhoneMeshService {
     this.onPresenceDetected = cb;
   }
 
+  setMyIdentity(_deviceId: string, _displayName: string): void {}
+
+  markMessageSeen(_msgIdHex: string): void {}
+
+  isMessageSeen(_msgIdHex: string): boolean { return false; }
+
+  isOwnSrcId(_srcIdHex: string): boolean { return false; }
+
+  async stopAllBroadcasting(): Promise<void> {}
+
   async startPresenceBeacon(_deviceId: string, _displayName: string): Promise<boolean> {
     console.log('[MockPhoneMesh] Presence beacon simulated');
     return true;

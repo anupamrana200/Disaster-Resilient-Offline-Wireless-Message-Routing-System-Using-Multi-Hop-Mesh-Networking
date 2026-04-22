@@ -226,7 +226,17 @@ export function useBLE(): UseBLEResult {
                     payload: manufData.slice(12, 22),
                   };
 
-                  // ── Android 11 self-scan guard ─────────────────────────────
+                  // ── Own-source guard (service-level identity) ─────────────
+                  // Ask PhoneMeshService if the chunk's srcIdHex belongs to us.
+                  // This is populated by setMyIdentity() AND by broadcastMessage(),
+                  // so it survives cases where myNodeIdRef.current is momentarily
+                  // empty (e.g. before the first render that writes into it).
+                  if (getPhoneMeshService().isOwnSrcId?.(chunk.srcIdHex)) {
+                    console.log(`[BLE] Dropping own chunk via isOwnSrcId msg=${chunk.msgIdHex}`);
+                    return;
+                  }
+
+                  // ── Android 11 self-scan guard (belt-and-braces) ──────────
                   // Android ≤11 (API 30) reports the device's own BLE
                   // advertisements back to its own scan listener. Android 12+
                   // does not. Without this check the sender would receive and
