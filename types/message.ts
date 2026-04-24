@@ -39,6 +39,14 @@ export interface Message {
 
   /** Number of relay hops this packet has traversed (loop prevention) */
   hops: number;
+
+  /**
+   * Which transport delivered (or was used to send) this message on THIS
+   * device. Purely local metadata — never serialized into MessagePacket —
+   * used by the UI to render a "(Mesh)" tag on Meshtastic-delivered messages
+   * so the user can tell LoRa hops apart from phone-mesh hops.
+   */
+  via?: 'meshtastic' | 'phone-mesh' | 'gatt';
 }
 
 /**

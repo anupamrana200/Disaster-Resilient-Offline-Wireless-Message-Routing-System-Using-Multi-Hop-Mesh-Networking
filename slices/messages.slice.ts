@@ -130,6 +130,20 @@ const slice = createSlice({
       if (msg) msg.status = payload.status;
     },
 
+    /**
+     * Tag an existing message with the transport that delivered it (in-memory
+     * only). Used by the UI to render a "(Mesh)" label on Meshtastic-delivered
+     * messages without requiring a storage write for what is purely a local
+     * metadata hint.
+     */
+    updateViaLocal: (
+      state,
+      { payload }: PayloadAction<{ id: string; via: Message['via'] }>,
+    ) => {
+      const msg = state.messages.find(m => m.message_id === payload.id);
+      if (msg) msg.via = payload.via;
+    },
+
     /** Add a seen ID to the in-memory dedup cache. */
     addSeenId: (state, { payload }: PayloadAction<string>) => {
       if (!state.seenIds.includes(payload)) {
@@ -219,7 +233,7 @@ const slice = createSlice({
   },
 });
 
-export const { addMessageLocal, updateStatusLocal, addSeenId, clearMessages } = slice.actions;
+export const { addMessageLocal, updateStatusLocal, updateViaLocal, addSeenId, clearMessages } = slice.actions;
 
 // ─── Hook ────────────────────────────────────────────────────────────────────
 

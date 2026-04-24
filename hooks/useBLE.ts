@@ -28,6 +28,7 @@ import { MESH_SERVICE_UUID } from '@/services/ble.service';
 import type { MessageReceivedCallback } from '@/services/ble.service';
 import { getPhoneMeshService } from '@/services/phone-mesh-adapter';
 import { useNodesSlice } from '@/slices/nodes.slice';
+import { dlog } from '@/services/debug-log.service';
 
 interface UseBLEResult {
   isReady: boolean;
@@ -273,6 +274,7 @@ export function useBLE(): UseBLEResult {
             } else {
               // Meshtastic nodes advertise their name as "Meshtastic_xxxx"
               if (deviceName.toLowerCase().includes('meshtastic')) {
+                dlog.info('BLE', `Meshtastic node seen: ${deviceName} (${deviceId}) rssi=${rssi}`);
                 dispatch(upsertNode({
                   node_id: deviceId,
                   name: deviceName.trim() || `Meshtastic-${deviceId.slice(-5).replace(':', '')}`,
@@ -337,9 +339,11 @@ export function useBLE(): UseBLEResult {
 
   const connectToNode = useCallback(
     async (nodeId: string): Promise<boolean> => {
+      dlog.info('BLE', `connectToNode start ${nodeId}`);
       try {
         const ble = getBLEService();
         await ble.connectToDevice(nodeId, (disconnectedId: string, _error: any) => {
+          dlog.warn('BLE', `disconnected ${disconnectedId}`);
           dispatch(setNodeDisconnected(disconnectedId));
           const timer = setTimeout(() => {
             connectToNode(disconnectedId);
@@ -348,9 +352,10 @@ export function useBLE(): UseBLEResult {
         });
 
         dispatch(setNodeConnected(nodeId));
+        dlog.info('BLE', `connected ${nodeId}`);
         return true;
-      } catch (err) {
-        console.warn('[BLE] Connection failed:', err);
+      } catch (err: any) {
+        dlog.error('BLE', `connect failed: ${err?.message || err}`);
         return false;
       }
     },

@@ -38,7 +38,12 @@ export default function MessageBubble({ message, isOwn }: Props) {
     <View style={[styles.row, isOwn ? styles.rowOwn : styles.rowOther]}>
       <View style={[styles.bubble, isOwn ? styles.bubbleOwn : styles.bubbleOther]}>
         {!isOwn && (
-          <Text style={styles.senderName}>{message.source_name}</Text>
+          <View style={styles.senderRow}>
+            <Text style={styles.senderName}>{message.source_name}</Text>
+            {message.via === 'meshtastic' && (
+              <Text style={styles.meshTag}> (Mesh)</Text>
+            )}
+          </View>
         )}
         <Text style={[styles.payload, isOwn ? styles.payloadOwn : styles.payloadOther]}>
           {message.payload}
@@ -46,6 +51,9 @@ export default function MessageBubble({ message, isOwn }: Props) {
         <View style={styles.footer}>
           <Text style={styles.time}>{formatTime(message.timestamp)}</Text>
           {isOwn && <StatusLabel status={message.status} />}
+          {isOwn && message.via === 'meshtastic' && (
+            <Text style={styles.meshTag}>(Mesh)</Text>
+          )}
           {message.hops > 0 && (
             <Text style={styles.hops}> ↷{message.hops}</Text>
           )}
@@ -86,11 +94,21 @@ const styles = StyleSheet.create({
     backgroundColor: '#1e2535',
     borderBottomLeftRadius: 4,
   },
+  senderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 3,
+  },
   senderName: {
     fontSize: 11,
     fontWeight: '700',
     color: '#60b4ff',
-    marginBottom: 3,
+    fontFamily: 'OpenSans-Semibold',
+  },
+  meshTag: {
+    fontSize: 10,
+    fontWeight: '600',
+    color: '#ff9f0a',
     fontFamily: 'OpenSans-Semibold',
   },
   payload: {

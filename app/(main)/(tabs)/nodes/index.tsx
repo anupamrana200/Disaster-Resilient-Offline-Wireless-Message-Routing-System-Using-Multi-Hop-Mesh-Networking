@@ -22,6 +22,7 @@ import { LinearGradient } from 'expo-linear-gradient';
 import { useMesh } from '@/hooks/useMesh';
 import NodeCard from '@/components/nodes/NodeCard';
 import RadarAnimation from '@/components/nodes/RadarAnimation';
+import DebugLogPanel from '@/components/nodes/DebugLogPanel';
 import { MeshNode } from '@/types';
 
 export default function NodesScreen() {
@@ -86,6 +87,9 @@ export default function NodesScreen() {
             </Text>
           </TouchableOpacity>
         </View>
+
+        {/* Debug Log */}
+        <DebugLogPanel />
 
         {/* Node List */}
         <View style={styles.listHeader}>

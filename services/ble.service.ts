@@ -28,11 +28,31 @@ import { Platform, PermissionsAndroid } from 'react-native';
 import { Buffer } from 'buffer';
 
 // ─── GATT UUIDs ───────────────────────────────────────────────────────────────
-// These must match exactly what is programmed in the ESP32 firmware.
+//
+// Two independent GATT profiles are tracked here:
+//
+// 1) Phone-mesh / ESP32 demo profile (legacy raw-JSON write path).
+//    Kept for the DisasterMesh phone-peer discovery UUID — this is what
+//    react-native-ble-advertiser uses to tag our presence beacons and message
+//    chunks so other phones can recognise them during a scan.
+//
+// 2) Official Meshtastic BLE profile. Used by MeshtasticService to talk to
+//    real Meshtastic firmware over GATT (protobuf ToRadio / FromRadio frames).
+//    The stock firmware advertises the service UUID below; the three
+//    characteristics implement the full Meshtastic BLE API.
 
+/** DisasterMesh phone-peer scan tag (not a Meshtastic UUID). */
 export const MESH_SERVICE_UUID = '4fafc201-1fb5-459e-8fcc-c5c9c331914b';
-export const MESH_CHAR_TX_UUID = 'beb5483e-36e1-4688-b7f5-ea07361b26a8'; // phone→node
-export const MESH_CHAR_RX_UUID = 'beb5483e-36e1-4688-b7f5-ea07361b26a9'; // node→phone
+/** Legacy ESP32 demo write char — retained for phone-mesh compatibility only. */
+export const MESH_CHAR_TX_UUID = 'beb5483e-36e1-4688-b7f5-ea07361b26a8';
+/** Legacy ESP32 demo notify char — retained for phone-mesh compatibility only. */
+export const MESH_CHAR_RX_UUID = 'beb5483e-36e1-4688-b7f5-ea07361b26a9';
+
+// Official Meshtastic BLE profile — used by services/meshtastic.service.ts.
+export const MESHTASTIC_SERVICE_UUID      = '6ba1b218-15a8-461f-9fa8-5dcae273eafd';
+export const MESHTASTIC_TORADIO_UUID      = 'f75c76d2-129e-4dad-a1dd-7866124401e7'; // write: phone → node
+export const MESHTASTIC_FROMRADIO_UUID    = '2c55e69e-4993-11ed-b878-0242ac120002'; // read+notify: node → phone
+export const MESHTASTIC_FROMNUM_UUID      = 'ed9da18c-a800-4f66-a670-aa7547e34453'; // notify: "data ready, go read FromRadio"
 
 /** Callback signatures */
 export type DeviceFoundCallback = (device: Device) => void;
@@ -210,6 +230,16 @@ class BLEService {
     await device.discoverAllServicesAndCharacteristics();
     this.connectedDevices.set(deviceId, device);
 
+    // Log discovered services for debugging (Meshtastic / ESP32 detection)
+    try {
+      const services = await device.services();
+      const svcUuids = services.map(s => s.uuid).join(', ');
+      console.log(`[BLE] ${deviceId} services: ${svcUuids}`);
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { dlog } = require('./debug-log.service');
+      dlog.info('BLE', `${deviceId.slice(-8)} services: ${svcUuids || '(none)'}`);
+    } catch (_) {}
+
     // Set up disconnect listener for reconnect logic
     device.onDisconnected((error, _dev) => {
       this.connectedDevices.delete(deviceId);
@@ -304,6 +334,107 @@ class BLEService {
 
     this.notifySubscriptions.set(deviceId, subscription);
     return () => subscription.remove();
+  }
+
+  // ─── Raw characteristic helpers (used by MeshtasticService) ────────────────
+
+  /**
+   * Write raw bytes to any characteristic on a connected device.
+   * Tries write-with-response first; if the characteristic does not support
+   * that, falls back to write-without-response. Meshtastic's ToRadio on some
+   * firmware revs only implements one of the two, so we try both.
+   */
+  async writeRaw(
+    deviceId: string,
+    serviceUuid: string,
+    charUuid: string,
+    data: Uint8Array,
+  ): Promise<boolean> {
+    const device = this.connectedDevices.get(deviceId);
+    if (!device) {
+      console.warn('[BLE] writeRaw: device not connected', deviceId);
+      return false;
+    }
+    const encoded = Buffer.from(data).toString('base64');
+    const withTimeout = <T,>(p: Promise<T>, label: string) =>
+      Promise.race([
+        p.then(v => ({ ok: true, v, err: null as any })),
+        new Promise<{ ok: false; v: null; err: Error }>((resolve) =>
+          setTimeout(() => resolve({ ok: false, v: null, err: new Error(`${label} timeout`) }), 4000),
+        ),
+      ]);
+    const r1 = await withTimeout(
+      device.writeCharacteristicWithResponseForService(serviceUuid, charUuid, encoded),
+      'writeWithResponse',
+    ).catch((err: Error) => ({ ok: false, v: null, err }));
+    if (r1.ok) return true;
+    const r2 = await withTimeout(
+      device.writeCharacteristicWithoutResponseForService(serviceUuid, charUuid, encoded),
+      'writeWithoutResponse',
+    ).catch((err: Error) => ({ ok: false, v: null, err }));
+    if (r2.ok) return true;
+    console.warn('[BLE] writeRaw failed (both modes):', r1.err?.message, '|', r2.err?.message);
+    return false;
+  }
+
+  /**
+   * Read raw bytes from any characteristic. Returns null on failure, empty
+   * read, or if the read takes longer than 3 seconds (which on Meshtastic
+   * typically means the firmware is refusing to answer).
+   */
+  async readRaw(
+    deviceId: string,
+    serviceUuid: string,
+    charUuid: string,
+  ): Promise<Uint8Array | null> {
+    const device = this.connectedDevices.get(deviceId);
+    if (!device) return null;
+    try {
+      const readPromise = device.readCharacteristicForService(serviceUuid, charUuid);
+      const timeout = new Promise<null>((resolve) =>
+        setTimeout(() => resolve(null), 3000),
+      );
+      const c = await Promise.race([readPromise, timeout]);
+      if (!c) {
+        console.warn('[BLE] readRaw timed out after 3s');
+        return null;
+      }
+      if (!c?.value) return null;
+      return new Uint8Array(Buffer.from(c.value, 'base64'));
+    } catch (err) {
+      console.warn('[BLE] readRaw error:', err);
+      return null;
+    }
+  }
+
+  /**
+   * Monitor any characteristic for notifications with a raw-bytes callback.
+   * Returns a cleanup function. Multiple monitors on the same device are OK
+   * (they are held in a separate subscription map keyed by characteristic).
+   */
+  monitorRaw(
+    deviceId: string,
+    serviceUuid: string,
+    charUuid: string,
+    onData: (bytes: Uint8Array) => void,
+  ): () => void {
+    const device = this.connectedDevices.get(deviceId);
+    if (!device) return () => {};
+    const sub = device.monitorCharacteristicForService(
+      serviceUuid,
+      charUuid,
+      (error, characteristic: Characteristic | null) => {
+        if (error) {
+          // disconnection triggers a cancellation error — silence it
+          return;
+        }
+        if (characteristic?.value) {
+          const bytes = new Uint8Array(Buffer.from(characteristic.value, 'base64'));
+          onData(bytes);
+        }
+      },
+    );
+    return () => sub.remove();
   }
 
   // ─── Cleanup ─────────────────────────────────────────────────────────────────
