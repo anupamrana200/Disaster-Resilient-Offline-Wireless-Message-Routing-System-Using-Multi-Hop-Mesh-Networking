@@ -54,6 +54,12 @@ export function useBLE(): UseBLEResult {
   const isReadyRef = useRef(false);
   const isScanningRef = useRef(false);
   const scanListenerRef = useRef<any>(null);
+  /** Last time an onDeviceFound event fired — used by the watchdog to detect
+   *  a wedged BLE-advertiser scanner. While Meshtastic GATT is busy, the
+   *  Android BLE stack occasionally drops the scan callback silently, which
+   *  is exactly the "BLE stops working after a few messages" symptom. */
+  const lastScanEventAtRef = useRef<number>(Date.now());
+  const scanWatchdogRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Always-fresh ref — never stale in closures.
   // Used to filter out our own BLE advertisement chunks on Android 11,
@@ -125,6 +131,10 @@ export function useBLE(): UseBLEResult {
         scanListenerRef.current.remove();
         scanListenerRef.current = null;
       }
+      if (scanWatchdogRef.current) {
+        clearInterval(scanWatchdogRef.current);
+        scanWatchdogRef.current = null;
+      }
       try {
         // eslint-disable-next-line @typescript-eslint/no-require-imports
         const BLEAdvertiser = require('react-native-ble-advertiser');
@@ -177,6 +187,7 @@ export function useBLE(): UseBLEResult {
       scanListenerRef.current = DeviceEventEmitter.addListener(
         'onDeviceFound',
         (event: any) => {
+          lastScanEventAtRef.current = Date.now();
           try {
             const deviceId: string = event.deviceAddress ?? event.deviceName ?? `unknown-${Date.now()}`;
             const deviceName: string = event.deviceName ?? '';
@@ -311,6 +322,35 @@ export function useBLE(): UseBLEResult {
       setIsScanningState(true);
       isScanningRef.current = true;
       dispatch(setScanning(true));
+      lastScanEventAtRef.current = Date.now();
+
+      // Watchdog — if no scan events arrive for 15 s the BLE-advertiser
+      // scanner has likely been wedged by heavy GATT activity (Meshtastic
+      // FromRadio reads). Restart the scan to recover. In a normally
+      // populated environment we always see at least one advertisement
+      // per second from background BLE devices, so 15 s of silence is a
+      // reliable wedged-scanner signal.
+      if (scanWatchdogRef.current) clearInterval(scanWatchdogRef.current);
+      scanWatchdogRef.current = setInterval(() => {
+        if (!isScanningRef.current) return;
+        const idleMs = Date.now() - lastScanEventAtRef.current;
+        if (idleMs > 15000) {
+          console.warn(`[BLE] Scan watchdog: no events for ${idleMs}ms — restarting scanner`);
+          try {
+            BLEAdvertiser.stopScan();
+          } catch (_) {}
+          BLEAdvertiser.scan(null, {
+            scanMode: 2,
+            numberOfMatches: 3,
+            matchMode: 1,
+          })
+            .then(() => {
+              console.log('[BLE] ✅ Scan restarted by watchdog');
+              lastScanEventAtRef.current = Date.now();
+            })
+            .catch((err: any) => console.warn('[BLE] Watchdog scan restart failed:', err));
+        }
+      }, 5000);
 
     } catch (err) {
       console.error('[BLE] startScan error:', err);
@@ -327,6 +367,11 @@ export function useBLE(): UseBLEResult {
     if (scanListenerRef.current) {
       scanListenerRef.current.remove();
       scanListenerRef.current = null;
+    }
+
+    if (scanWatchdogRef.current) {
+      clearInterval(scanWatchdogRef.current);
+      scanWatchdogRef.current = null;
     }
 
     setIsScanningState(false);

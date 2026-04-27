@@ -61,6 +61,15 @@ const _processedMids = new Set<string>();
  */
 let _autoStarted = false;
 
+/**
+ * Module-level guard for the Meshtastic auto-connect effect. Multiple
+ * useMesh() instances mount in parallel (ChatScreen + NodesScreen tabs); we
+ * want at most ONE in-flight auto-connect attempt across the whole app.
+ * Reset to false after a connect attempt finishes (success or failure) so a
+ * new attempt can run if the node disappears and reappears later.
+ */
+let _autoConnectInFlight = false;
+
 interface UseMeshResult {
   messages: Message[];
   pendingCount: number;
@@ -117,6 +126,45 @@ export function useMesh(): UseMeshResult {
       ble.startScan();
     }
   }, [ble.isReady, nodesSlice.myNodeId]);
+
+  // ─── Auto-connect to nearest Meshtastic node ───────────────────────────────
+  // Whenever the nearby-nodes list changes, if a Meshtastic node is visible
+  // and we are not already connected to one, connect to the strongest-RSSI
+  // one automatically. This removes the manual "connect" step from the UI.
+  useEffect(() => {
+    if (!ble.isReady) return;
+    if (_autoConnectInFlight) return;
+
+    const meshtasticNodes = nodesSlice.nearbyNodes.filter(n => n.type === 'meshtastic');
+    if (meshtasticNodes.length === 0) return;
+
+    // Already connected to any Meshtastic node? Then nothing to do.
+    const alreadyConnected = meshtasticNodes.some(n =>
+      nodesSlice.connectedNodeIds.includes(n.node_id),
+    );
+    if (alreadyConnected) return;
+
+    // Pick the strongest signal — most likely to give a stable GATT session.
+    const target = [...meshtasticNodes].sort((a, b) => b.rssi - a.rssi)[0];
+
+    _autoConnectInFlight = true;
+    dlog.info('Mesh', `auto-connecting to nearest Meshtastic ${target.name} (rssi=${target.rssi})`);
+    ble.connectToNode(target.node_id)
+      .then(async (connected) => {
+        if (connected) {
+          dlog.info('Mesh', `auto-connect: BLE connected — running Meshtastic handshake`);
+          await getMeshtasticService().connect(target.node_id).catch((e) => {
+            dlog.error('Mesh', `auto-connect handshake failed: ${e?.message || e}`);
+            return false;
+          });
+        } else {
+          dlog.warn('Mesh', `auto-connect: BLE connect failed for ${target.name}`);
+        }
+      })
+      .finally(() => {
+        _autoConnectInFlight = false;
+      });
+  }, [nodesSlice.nearbyNodes, nodesSlice.connectedNodeIds, ble.isReady]);
 
   // ─── Setup PhoneMesh callbacks (phone-to-phone channel) ────────────────────
   // Depends on ble.isReady so the presence beacon is (re)started even when

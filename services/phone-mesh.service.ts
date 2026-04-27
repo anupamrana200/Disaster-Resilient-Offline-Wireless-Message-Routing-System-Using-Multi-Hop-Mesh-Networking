@@ -609,19 +609,30 @@ class PhoneMeshService {
     try { await BLEAdvertiser.stopBroadcast(); } catch (_) {}
     await new Promise(r => setTimeout(r, 50));
 
-    try {
-      await BLEAdvertiser.broadcast(MESH_SERVICE_UUID.toUpperCase(), data, {
-        advertiseMode: 2, // LOW_LATENCY — fastest delivery
-        txPowerLevel: 3,  // HIGH — maximum range
-        connectable: false,
-        includeDeviceName: false,
-        includeTxPowerLevel: false,
-      });
-    } catch (err) {
-      console.warn('[PhoneMesh] Broadcast error:', err);
+    let attempt = 0;
+    let lastErr: any = null;
+    while (attempt < 3) {
+      try {
+        await BLEAdvertiser.broadcast(MESH_SERVICE_UUID.toUpperCase(), data, {
+          advertiseMode: 2, // LOW_LATENCY — fastest delivery
+          txPowerLevel: 3,  // HIGH — maximum range
+          connectable: false,
+          includeDeviceName: false,
+          includeTxPowerLevel: false,
+        });
+        return; // success
+      } catch (err) {
+        lastErr = err;
+        attempt++;
+        // Common failure mode while Meshtastic GATT is busy: the radio is
+        // momentarily unavailable. Reset cleanly and retry with backoff so
+        // chunks aren't silently dropped — that's what causes the "BLE stops
+        // after a few messages once Meshtastic is connected" symptom.
+        try { await BLEAdvertiser.stopBroadcast(); } catch (_) {}
+        await new Promise(r => setTimeout(r, 150 * attempt));
+      }
     }
-    // Chunk stays live for the full interval; _processQueue stops it via
-    // the next stopBroadcast() call at the start of the following send.
+    console.warn('[PhoneMesh] Broadcast error after retries:', lastErr);
   }
 
   private _reassemble(buf: ChunkBuffer): string {

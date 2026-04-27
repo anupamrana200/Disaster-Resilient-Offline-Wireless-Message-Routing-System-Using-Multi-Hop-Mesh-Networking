@@ -237,6 +237,7 @@ class MeshtasticService {
   private deviceId: string | null = null;
   private fromNumCleanup: (() => void) | null = null;
   private draining = false;
+  private drainPending = false;
   private nodeNames: Map<number, string> = new Map();
   private myNodeNum = 0;
   private onTextMessage: TextMessageCallback | null = null;
@@ -264,7 +265,7 @@ class MeshtasticService {
       deviceId,
       MESHTASTIC_SERVICE_UUID,
       MESHTASTIC_FROMNUM_UUID,
-      () => { this._drainFromRadio().catch(() => {}); },
+      () => { this._scheduleDrain(); },
     );
 
     // Step 2: Send want_config_id to request full NodeDB dump
@@ -358,14 +359,45 @@ class MeshtasticService {
     return ok;
   }
 
+  /**
+   * Coalesce FromNum notifications. The radio notifies once per available
+   * frame, but a single drain reads many frames in one go — running a full
+   * 100-iteration drain per notification monopolises the BLE radio and starves
+   * the BLE-advertiser scan/broadcast (manifests as phone-mesh BLE traffic
+   * silently dying after a few messages once a Meshtastic node is connected).
+   *
+   * Strategy: at most one drain in flight; if a notification arrives during
+   * a drain, remember it and run exactly one more drain after it finishes.
+   * Steady-state notification storms collapse to a single tail drain instead
+   * of dozens of overlapping ones.
+   */
+  private _scheduleDrain(): void {
+    if (this.draining) {
+      this.drainPending = true;
+      return;
+    }
+    this._drainFromRadio().catch(() => {}).then(() => {
+      if (this.drainPending) {
+        this.drainPending = false;
+        this._scheduleDrain();
+      }
+    });
+  }
+
   private async _drainFromRadio(expectedConfigId?: number): Promise<boolean> {
     if (!this.deviceId || this.draining) return false;
     this.draining = true;
     let sawConfigComplete = false;
     let framesRead = 0;
 
+    // During the initial handshake we may have a large NodeDB to read, so
+    // allow up to 100 frames. For ongoing notification-driven drains, a
+    // small budget is enough — typical FromNum notifications mean 1-3 frames
+    // are queued. A bounded budget keeps the radio free for BLE-advertiser.
+    const maxFrames = expectedConfigId !== undefined ? 100 : 8;
+
     try {
-      for (let i = 0; i < 100; i++) {
+      for (let i = 0; i < maxFrames; i++) {
         const bytes = await getBLEService().readRaw(
           this.deviceId,
           MESHTASTIC_SERVICE_UUID,
@@ -385,6 +417,9 @@ class MeshtasticService {
         } catch (e: any) {
           dlog.warn('Meshtastic', `bad frame: ${e?.message || e}`);
         }
+        // Yield the radio briefly between reads so concurrent BLE-advertiser
+        // scan callbacks and broadcast() calls aren't starved.
+        await new Promise(r => setTimeout(r, 20));
       }
     } finally {
       this.draining = false;
