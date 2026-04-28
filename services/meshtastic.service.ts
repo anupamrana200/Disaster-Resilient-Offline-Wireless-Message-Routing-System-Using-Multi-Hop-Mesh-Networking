@@ -63,6 +63,9 @@ const BROADCAST_ADDR = 0xffffffff;
 /** PortNum.TEXT_MESSAGE_APP = 1 */
 const PORT_TEXT = 1;
 
+/** PortNum.NODEINFO_APP = 4 — used as a presence beacon to warm the LoRa channel. */
+const PORT_NODEINFO = 4;
+
 export interface MeshtasticTextMessage {
   fromNodeNum: number;
   fromName: string;
@@ -305,8 +308,50 @@ class MeshtasticService {
       dlog.warn('Meshtastic', `handshake timeout — myNodeNum=${this.myNodeNum}, proceeding`);
     }
 
+    // Step 4: Send a NODEINFO presence beacon to prime the LoRa channel.
+    // Without this, the first user text message after a fresh connect is often
+    // lost on the receiving node — peers haven't "heard" us yet so the first
+    // packet effectively acts as the channel-establishment frame. Sending a
+    // throwaway NODEINFO_APP broadcast here makes the user's first real text
+    // the *second* packet on the air, so it's delivered reliably.
+    try {
+      await this._sendBeacon();
+    } catch (e: any) {
+      dlog.warn('Meshtastic', `beacon send failed: ${e?.message || e}`);
+    }
+
     dlog.info('Meshtastic', `session ready on ${deviceId}`);
     return true;
+  }
+
+  /**
+   * Send an empty NODEINFO_APP broadcast as a presence beacon. Peers ignore
+   * the empty payload but the LoRa transmission registers our node on the
+   * mesh, so the next real text message isn't the cold-start packet.
+   */
+  private async _sendBeacon(): Promise<void> {
+    if (!this.deviceId) return;
+    const data = encodeData(PORT_NODEINFO, new Uint8Array(0));
+    const pktId = (Math.random() * 0xffffffff) >>> 0;
+    const meshPkt = encodeMeshPacket({
+      to: BROADCAST_ADDR,
+      from: 0,
+      id: pktId,
+      channel: 0,
+      hopLimit: 3,
+      wantAck: false,
+      decoded: data,
+    });
+    const toRadio = encodeToRadioPacket(meshPkt);
+    dlog.info('Meshtastic', `priming LoRa channel with NODEINFO beacon pktId=${pktId}`);
+    await getBLEService().writeRaw(
+      this.deviceId,
+      MESHTASTIC_SERVICE_UUID,
+      MESHTASTIC_TORADIO_UUID,
+      toRadio,
+    );
+    // Give the radio time to actually transmit before any user message follows
+    await new Promise(r => setTimeout(r, 250));
   }
 
   disconnect(): void {

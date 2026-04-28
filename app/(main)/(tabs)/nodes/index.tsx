@@ -123,7 +123,7 @@ export default function NodesScreen() {
           }
           refreshControl={
             <RefreshControl
-              refreshing={isScanning}
+              refreshing={false}
               onRefresh={startDiscovery}
               tintColor="#00c896"
               colors={['#00c896']}

@@ -19,14 +19,14 @@ function Router() {
         // Fonts/images failed to load — continue anyway
         console.warn('[Layout] Asset preload failed:', e);
       } finally {
-        // Always request notification permission — must run even if assets fail.
-        // On Android 13+ this shows the system POST_NOTIFICATIONS dialog.
-        try {
-          await setupNotifications();
-        } catch (e) {
-          console.warn('[Layout] setupNotifications failed:', e);
-        }
+        // Hide splash as soon as assets are ready. The notification permission
+        // prompt (Android 13+) blocks on user input, so it must NOT gate the
+        // splash — otherwise first launch leaves the splash stuck behind the
+        // system dialog.
         SplashScreen.hideAsync();
+        setupNotifications().catch(e => {
+          console.warn('[Layout] setupNotifications failed:', e);
+        });
       }
     })();
   }, []);
