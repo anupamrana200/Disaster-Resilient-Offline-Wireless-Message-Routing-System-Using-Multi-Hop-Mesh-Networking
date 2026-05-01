@@ -20,17 +20,14 @@ import { showMessageNotification } from '@/services/notification.service';
 import { useBLE } from './useBLE';
 import { useNodesSlice } from '@/slices/nodes.slice';
 import { useMessagesSlice } from '@/slices/messages.slice';
-import {
-  Message,
-  messageToPacket,
-  packetToMessage,
-  MessagePacket,
-  isExpired,
-} from '@/types';
+import { Message, messageToPacket, packetToMessage, MessagePacket, isExpired } from '@/types';
 import { getBLEService } from '@/services/ble-adapter';
 import { getPhoneMeshService } from '@/services/phone-mesh-adapter';
 import { getMeshtasticService, type MeshtasticTextMessage } from '@/services/meshtastic.service';
 import { dlog } from '@/services/debug-log.service';
+import { encodeSOSPayload } from '@/services/sos.service';
+// expo-location and expo-battery are loaded lazily inside sendSOS() so a
+// missing module on web/Expo Go cannot break the rest of the mesh hook.
 
 const MAX_HOPS = 5;
 
@@ -78,7 +75,17 @@ interface UseMeshResult {
   isScanning: boolean;
   myNodeId: string;
   myDisplayName: string;
-  sendMessage: (text: string, destinationId?: string) => Promise<'meshtastic' | 'phone-mesh' | 'queued'>;
+  sendMessage: (
+    text: string,
+    destinationId?: string,
+  ) => Promise<'meshtastic' | 'phone-mesh' | 'queued'>;
+  /**
+   * Compose and broadcast an SOS distress message containing the user's
+   * current GPS coordinates + battery level. Returns the same route token
+   * as sendMessage(), or 'no-permission' if location access was denied,
+   * or 'no-fix' if a GPS fix could not be obtained.
+   */
+  sendSOS: () => Promise<'meshtastic' | 'phone-mesh' | 'queued' | 'no-permission' | 'no-fix'>;
   startDiscovery: () => void;
   stopDiscovery: () => void;
   connectToNode: (nodeId: string) => Promise<boolean>;
@@ -149,14 +156,17 @@ export function useMesh(): UseMeshResult {
 
     _autoConnectInFlight = true;
     dlog.info('Mesh', `auto-connecting to nearest Meshtastic ${target.name} (rssi=${target.rssi})`);
-    ble.connectToNode(target.node_id)
-      .then(async (connected) => {
+    ble
+      .connectToNode(target.node_id)
+      .then(async connected => {
         if (connected) {
           dlog.info('Mesh', `auto-connect: BLE connected — running Meshtastic handshake`);
-          await getMeshtasticService().connect(target.node_id).catch((e) => {
-            dlog.error('Mesh', `auto-connect handshake failed: ${e?.message || e}`);
-            return false;
-          });
+          await getMeshtasticService()
+            .connect(target.node_id)
+            .catch(e => {
+              dlog.error('Mesh', `auto-connect handshake failed: ${e?.message || e}`);
+              return false;
+            });
         } else {
           dlog.warn('Mesh', `auto-connect: BLE connect failed for ${target.name}`);
         }
@@ -284,7 +294,9 @@ export function useMesh(): UseMeshResult {
         // guarantees each phone processes each message_id exactly once, so
         // enabling re-broadcast does NOT create infinite loops.
         const relayPacket = messageToPacket(msg);
-        getPhoneMeshService().broadcastMessage(relayPacket).catch(() => {});
+        getPhoneMeshService()
+          .broadcastMessage(relayPacket)
+          .catch(() => {});
 
         if (peerNode) {
           nodesSlice.dispatch(nodesSlice.incrementRelayCount(peerNode.node_id));
@@ -293,28 +305,31 @@ export function useMesh(): UseMeshResult {
     });
 
     // When a phone peer is detected via presence beacon
-    phoneMesh.setPresenceCallback((beacon: { type: string; deviceIdHex: string; displayName: string }) => {
-      // Ignore our own presence beacon
-      const myHex = nodesSlice.myNodeId.replace(/-/g, '').slice(0, 12);
-      if (beacon.deviceIdHex === myHex) return;
+    phoneMesh.setPresenceCallback(
+      (beacon: { type: string; deviceIdHex: string; displayName: string }) => {
+        // Ignore our own presence beacon
+        const myHex = nodesSlice.myNodeId.replace(/-/g, '').slice(0, 12);
+        if (beacon.deviceIdHex === myHex) return;
 
-      nodesSlice.dispatch(
-        nodesSlice.upsertNode({
-          node_id: `phone-${beacon.deviceIdHex}`,
-          name: beacon.displayName || `Phone-${beacon.deviceIdHex.slice(0, 4)}`,
-          rssi: -70, // unknown — not in presence beacon
-          type: 'ble-phone',
-          last_seen: Date.now(),
-          is_connected: false,
-          relay_count: 0,
-        }),
-      );
-    });
+        nodesSlice.dispatch(
+          nodesSlice.upsertNode({
+            node_id: `phone-${beacon.deviceIdHex}`,
+            name: beacon.displayName || `Phone-${beacon.deviceIdHex.slice(0, 4)}`,
+            rssi: -70, // unknown — not in presence beacon
+            type: 'ble-phone',
+            last_seen: Date.now(),
+            is_connected: false,
+            relay_count: 0,
+          }),
+        );
+      },
+    );
 
     // Start presence beacon so we appear in other phones' node lists.
     // Guard with ble.isReady — broadcast() will fail silently if BLE is off.
     if (nodesSlice.myNodeId && ble.isReady) {
-      phoneMesh.startPresenceBeacon(nodesSlice.myNodeId, nodesSlice.myDisplayName)
+      phoneMesh
+        .startPresenceBeacon(nodesSlice.myNodeId, nodesSlice.myDisplayName)
         .then((ok: boolean) => console.log('[Mesh] Presence beacon:', ok ? 'started' : 'failed'))
         .catch((e: any) => console.warn('[Mesh] Presence beacon error:', e));
     }
@@ -335,7 +350,7 @@ export function useMesh(): UseMeshResult {
       msgsSlice.dispatch(msgsSlice.addSeenId(dedupKey));
 
       const msg: Message = {
-        message_id: uuidv4(),  // fresh UUID so Redux/storage never collides
+        message_id: uuidv4(), // fresh UUID so Redux/storage never collides
         source_id: `meshtastic-${incoming.fromNodeNum.toString(16)}`,
         destination_id: '*',
         source_name: incoming.fromName,
@@ -447,9 +462,11 @@ export function useMesh(): UseMeshResult {
         connectedNodeIdsRef.current.includes(n.node_id),
       );
 
-      dlog.info('Mesh',
+      dlog.info(
+        'Mesh',
         `sendMessage: meshtastic visible=${meshtasticNodes.length} connected=${connectedMeshtastic.length} ` +
-        `allConnected=[${connectedNodeIdsRef.current.join(',')}]`);
+          `allConnected=[${connectedNodeIdsRef.current.join(',')}]`,
+      );
 
       const mt = getMeshtasticService();
 
@@ -465,12 +482,16 @@ export function useMesh(): UseMeshResult {
         const sentViaMeshtastic = await mt.sendText(msg.payload, 0);
         if (sentViaMeshtastic) {
           broadcastOk = true;
-          await msgsSlice.dispatch(msgsSlice.updateStatusAsync({ id: msg.message_id, status: 'sent' }));
+          await msgsSlice.dispatch(
+            msgsSlice.updateStatusAsync({ id: msg.message_id, status: 'sent' }),
+          );
           msgsSlice.dispatch(msgsSlice.updateViaLocal({ id: msg.message_id, via: 'meshtastic' }));
           dlog.info('Mesh', 'delivered via Meshtastic (LoRa LONG_FAST)');
           // Also broadcast via phone-mesh BLE so phones without a Meshtastic
           // connection (device 3 in a 3-phone network) also receive the message.
-          getPhoneMeshService().broadcastMessage(packet).catch(() => {});
+          getPhoneMeshService()
+            .broadcastMessage(packet)
+            .catch(() => {});
           dlog.info('Mesh', 'also broadcast via phone-mesh BLE for non-Meshtastic peers');
           return 'meshtastic';
         } else {
@@ -486,11 +507,15 @@ export function useMesh(): UseMeshResult {
           const sentViaMeshtastic = await mt.sendText(msg.payload, 0);
           if (sentViaMeshtastic) {
             broadcastOk = true;
-            await msgsSlice.dispatch(msgsSlice.updateStatusAsync({ id: msg.message_id, status: 'sent' }));
+            await msgsSlice.dispatch(
+              msgsSlice.updateStatusAsync({ id: msg.message_id, status: 'sent' }),
+            );
             msgsSlice.dispatch(msgsSlice.updateViaLocal({ id: msg.message_id, via: 'meshtastic' }));
             dlog.info('Mesh', 'delivered via Meshtastic (after auto-connect)');
             // Same dual-broadcast for auto-connect path
-            getPhoneMeshService().broadcastMessage(packet).catch(() => {});
+            getPhoneMeshService()
+              .broadcastMessage(packet)
+              .catch(() => {});
             dlog.info('Mesh', 'also broadcast via phone-mesh BLE for non-Meshtastic peers');
             return 'meshtastic';
           } else {
@@ -523,6 +548,88 @@ export function useMesh(): UseMeshResult {
       return 'queued';
     },
     [nodesSlice.myNodeId, nodesSlice.myDisplayName, ble.connectToNode, ble.sendToNode],
+  );
+
+  // ─── SOS — broadcast current GPS + battery via the existing mesh ──────────
+  // This deliberately reuses sendMessage() so the SOS gets the full benefit
+  // of the dual-transport routing (Meshtastic → phone-mesh → queue), the
+  // 3-layer dedup, the relay re-broadcast, and persistent storage. The only
+  // SOS-specific work here is acquiring the GPS fix + battery level, then
+  // formatting them into the agreed `SOS|lat|lon|acc|batt` wire payload.
+  const sendSOS = useCallback(
+    async (): Promise<'meshtastic' | 'phone-mesh' | 'queued' | 'no-permission' | 'no-fix'> => {
+      try {
+        // Lazy-require so a build that omits expo-location (web, mock) doesn't
+        // crash at module-load time — we only need the module when SOS is used.
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const Location = require('expo-location');
+
+        // Step 1 — request foreground location permission.
+        // On Android this triggers the standard system permission dialog;
+        // already-granted users see no prompt. iOS handled identically.
+        const { status } = await Location.requestForegroundPermissionsAsync();
+        if (status !== 'granted') {
+          dlog.warn('SOS', 'location permission denied — aborting SOS');
+          return 'no-permission';
+        }
+
+        // Step 2 — get a fresh, high-accuracy GPS fix.
+        // High accuracy = uses GPS chip directly (works fully offline). The
+        // first fix after a long idle can take 30-90s in airplane mode, so
+        // a 20s timeout balances responsiveness with disaster-scenario reality.
+        let loc: any = null;
+        try {
+          loc = await Promise.race([
+            Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High }),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('GPS timeout')), 20_000)),
+          ]);
+        } catch (err: any) {
+          dlog.error('SOS', `GPS fix failed: ${err?.message || err}`);
+          // Fallback — if we have a cached last-known position, use it rather
+          // than fail the SOS entirely. A slightly-stale fix is far better
+          // than no SOS at all in a disaster.
+          try {
+            loc = await Location.getLastKnownPositionAsync();
+          } catch (_) {
+            loc = null;
+          }
+          if (!loc) return 'no-fix';
+        }
+
+        // Step 3 — best-effort battery level. expo-battery is loaded lazily
+        // and the SOS still goes out (with battery=0) if the module is missing.
+        let batteryPct = 0;
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-require-imports
+          const Battery = require('expo-battery');
+          const lvl = await Battery.getBatteryLevelAsync();
+          if (typeof lvl === 'number' && lvl >= 0) batteryPct = Math.round(lvl * 100);
+        } catch (_) {
+          // expo-battery missing or unavailable — silently fall through with 0
+        }
+
+        // Step 4 — encode payload and dispatch through the regular mesh send.
+        // sendMessage() handles routing, status updates, dedup pre-marking,
+        // and pending-queue fallback so SOS gets all the same guarantees as
+        // a normal chat message.
+        const payload = encodeSOSPayload(
+          loc.coords.latitude,
+          loc.coords.longitude,
+          loc.coords.accuracy ?? 0,
+          batteryPct,
+        );
+        dlog.info('SOS', `dispatching SOS payload: ${payload}`);
+        const route = await sendMessage(payload);
+        dlog.info('SOS', `SOS dispatched via ${route}`);
+        return route;
+      } catch (err: any) {
+        dlog.error('SOS', `unexpected error: ${err?.message || err}`);
+        return 'no-fix';
+      }
+    },
+    // sendMessage already captures myNodeId/myDisplayName via its own deps,
+    // so we only need to re-bind when sendMessage's identity changes.
+    [sendMessage],
   );
 
   // ─── Transmit via GATT to all connected ESP32 nodes ────────────────────────
@@ -608,7 +715,8 @@ export function useMesh(): UseMeshResult {
 
     // Start presence beacon so other DM phones can see our display name
     if (nodesSlice.myNodeId) {
-      phoneMesh.startPresenceBeacon(nodesSlice.myNodeId, nodesSlice.myDisplayName)
+      phoneMesh
+        .startPresenceBeacon(nodesSlice.myNodeId, nodesSlice.myDisplayName)
         .then((ok: boolean) => console.log('[Mesh] Presence beacon started:', ok))
         .catch((e: any) => console.warn('[Mesh] Presence beacon error:', e));
     }
@@ -644,6 +752,7 @@ export function useMesh(): UseMeshResult {
     myNodeId: nodesSlice.myNodeId,
     myDisplayName: nodesSlice.myDisplayName,
     sendMessage,
+    sendSOS,
     startDiscovery,
     stopDiscovery,
     connectToNode: ble.connectToNode,

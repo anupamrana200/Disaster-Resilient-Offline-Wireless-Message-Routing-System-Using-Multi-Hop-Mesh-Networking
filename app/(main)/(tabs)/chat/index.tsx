@@ -35,9 +35,7 @@ import { Message, MeshNode } from '@/types';
  * presence beacon's deviceIdHex. Falls back to the name stored on the message.
  */
 function resolveSenderName(msg: Message, nearbyNodes: MeshNode[]): string {
-  const peer = nearbyNodes.find(n =>
-    n.node_id.replace('phone-', '').startsWith(msg.source_id),
-  );
+  const peer = nearbyNodes.find(n => n.node_id.replace('phone-', '').startsWith(msg.source_id));
   return peer?.name || msg.source_name;
 }
 
@@ -52,6 +50,9 @@ export default function ChatScreen() {
     connectedNodeIds,
     isScanning,
     sendMessage,
+    // Pulled in additionally so the new SOS button can dispatch via the same
+    // mesh — does not affect any of the existing chat-send behaviour.
+    sendSOS,
   } = useMesh();
 
   // For status: count both GATT connections AND nearby phone peers
@@ -65,26 +66,73 @@ export default function ChatScreen() {
   const toastOpacity = useRef(new Animated.Value(0)).current;
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const showRouteToast = useCallback((route: 'meshtastic' | 'phone-mesh' | 'queued') => {
-    if (toastTimer.current) clearTimeout(toastTimer.current);
-    const config: Record<typeof route, RouteToast> = {
-      meshtastic: { message: '📡 Sent via Meshtastic (LoRa)', color: '#ff9f0a' },
-      'phone-mesh': { message: '📱 Broadcasting via phone mesh', color: '#60b4ff' },
-      queued:       { message: '⏳ Queued — no nodes nearby', color: '#ff453a' },
-    };
-    setRouteToast(config[route]);
-    toastOpacity.setValue(0);
-    Animated.sequence([
-      Animated.timing(toastOpacity, { toValue: 1, duration: 200, useNativeDriver: true }),
-      Animated.delay(2200),
-      Animated.timing(toastOpacity, { toValue: 0, duration: 300, useNativeDriver: true }),
-    ]).start(() => setRouteToast(null));
-  }, [toastOpacity]);
+  // Extended union — adds the two SOS-only outcomes ('no-permission' / 'no-fix')
+  // so they can be surfaced to the user via the same toast affordance.
+  type SOSRoute = 'meshtastic' | 'phone-mesh' | 'queued' | 'no-permission' | 'no-fix';
+  const showRouteToast = useCallback(
+    (route: SOSRoute) => {
+      if (toastTimer.current) clearTimeout(toastTimer.current);
+      const config: Record<SOSRoute, RouteToast> = {
+        meshtastic: { message: '📡 Sent via Meshtastic (LoRa)', color: '#ff9f0a' },
+        'phone-mesh': { message: '📱 Broadcasting via phone mesh', color: '#60b4ff' },
+        queued: { message: '⏳ Queued — no nodes nearby', color: '#ff453a' },
+        // Distinct messages for the SOS-only failure modes so users know what to fix
+        'no-permission': { message: '🚫 Location permission needed for SOS', color: '#ff453a' },
+        'no-fix': { message: '📡 Could not get GPS fix — try outdoors', color: '#ff9f0a' },
+      };
+      setRouteToast(config[route]);
+      toastOpacity.setValue(0);
+      Animated.sequence([
+        Animated.timing(toastOpacity, { toValue: 1, duration: 200, useNativeDriver: true }),
+        Animated.delay(2200),
+        Animated.timing(toastOpacity, { toValue: 0, duration: 300, useNativeDriver: true }),
+      ]).start(() => setRouteToast(null));
+    },
+    [toastOpacity],
+  );
 
-  const handleSend = useCallback(async (text: string) => {
-    const route = await sendMessage(text);
+  const handleSend = useCallback(
+    async (text: string) => {
+      const route = await sendMessage(text);
+      showRouteToast(route);
+    },
+    [sendMessage, showRouteToast],
+  );
+
+  // SOS handler — delegates to useMesh.sendSOS() then surfaces the result via
+  // the same toast component. No additional UI gating because sendSOS handles
+  // permission + GPS errors internally and reports them through the route token.
+  const handleSOS = useCallback(async () => {
+    const route = await sendSOS();
     showRouteToast(route);
-  }, [sendMessage, showRouteToast]);
+  }, [sendSOS, showRouteToast]);
+
+  // ─── Receiver location (best-effort) ─────────────────────────────────────
+  // Used only by SOSCard to render "X km NE of you" — purely a UX nicety,
+  // never blocks anything else. GPS module is required lazily so a missing
+  // expo-location won't break the chat screen.
+  const [myLocation, setMyLocation] = useState<{ lat: number; lon: number } | null>(null);
+  useEffect(() => {
+    (async () => {
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const Location = require('expo-location');
+        // Don't request permissions here — only consume what the user already
+        // granted. The SOS-send path explicitly requests permission when needed.
+        const { status } = await Location.getForegroundPermissionsAsync();
+        if (status !== 'granted') return;
+        // Cached last-known position is good enough for distance hints. We
+        // intentionally avoid a fresh GPS fix here so the chat screen mounts fast.
+        const fix = await Location.getLastKnownPositionAsync();
+        if (fix?.coords) {
+          setMyLocation({ lat: fix.coords.latitude, lon: fix.coords.longitude });
+        }
+      } catch (_) {
+        // Module missing / any other error — silently leave myLocation as null.
+        // SOSCard handles the null case by simply omitting the distance line.
+      }
+    })();
+  }, []);
 
   // Scanning starts automatically inside useMesh once BLE is ready.
 
@@ -136,10 +184,7 @@ export default function ChatScreen() {
 
   return (
     <SafeAreaView style={styles.safeArea}>
-      <LinearGradient
-        colors={['#0a0e1a', '#0d1117', '#0a0e1a']}
-        style={styles.container}
-      >
+      <LinearGradient colors={['#0a0e1a', '#0d1117', '#0a0e1a']} style={styles.container}>
         {/* Header */}
         <View style={styles.header}>
           <View style={styles.headerLeft}>
@@ -151,7 +196,9 @@ export default function ChatScreen() {
               <Text style={styles.headerSub}>
                 {totalMeshPeers > 0
                   ? `${totalMeshPeers} device${totalMeshPeers > 1 ? 's' : ''} in mesh`
-                  : isScanning ? 'Scanning...' : 'Offline'}
+                  : isScanning
+                    ? 'Scanning...'
+                    : 'Offline'}
               </Text>
             </View>
           </View>
@@ -174,15 +221,12 @@ export default function ChatScreen() {
         <KeyboardAvoidingView
           style={styles.keyboardView}
           behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-          keyboardVerticalOffset={0}
-        >
+          keyboardVerticalOffset={0}>
           <FlatList
             ref={listRef}
             id="chat-message-list"
             data={flatItems as any}
-            keyExtractor={(item: any) =>
-              item.type === 'separator' ? item.key : item.message_id
-            }
+            keyExtractor={(item: any) => (item.type === 'separator' ? item.key : item.message_id)}
             renderItem={({ item }: any) => {
               if (item.type === 'separator') {
                 return (
@@ -194,11 +238,18 @@ export default function ChatScreen() {
                 );
               }
               const msg = item as Message;
-              const resolvedMsg = msg.source_id === deviceId
-                ? msg
-                : { ...msg, source_name: resolveSenderName(msg, nearbyNodes) };
+              const resolvedMsg =
+                msg.source_id === deviceId
+                  ? msg
+                  : { ...msg, source_name: resolveSenderName(msg, nearbyNodes) };
               return (
-                <MessageBubble message={resolvedMsg} isOwn={msg.source_id === deviceId} />
+                // myLocation enables the "X km NE of you" line on incoming
+                // SOS cards. Plain chat bubbles ignore the prop entirely.
+                <MessageBubble
+                  message={resolvedMsg}
+                  isOwn={msg.source_id === deviceId}
+                  myLocation={myLocation}
+                />
               );
             }}
             ListEmptyComponent={renderEmpty}
@@ -209,14 +260,18 @@ export default function ChatScreen() {
             showsVerticalScrollIndicator={false}
           />
 
-          {/* Input Bar */}
-          <ChatInput onSend={handleSend} disabled={!nodeReady} />
+          {/* Input Bar — onSOS is the new optional hook that activates the
+              red 🆘 button. Existing send behaviour is untouched. */}
+          <ChatInput onSend={handleSend} onSOS={handleSOS} disabled={!nodeReady} />
         </KeyboardAvoidingView>
 
         {/* Route toast — shows which channel was used after sending */}
         {routeToast && (
-          <Animated.View style={[styles.routeToast, { opacity: toastOpacity, borderColor: routeToast.color }]}>
-            <Text style={[styles.routeToastText, { color: routeToast.color }]}>{routeToast.message}</Text>
+          <Animated.View
+            style={[styles.routeToast, { opacity: toastOpacity, borderColor: routeToast.color }]}>
+            <Text style={[styles.routeToastText, { color: routeToast.color }]}>
+              {routeToast.message}
+            </Text>
           </Animated.View>
         )}
       </LinearGradient>
