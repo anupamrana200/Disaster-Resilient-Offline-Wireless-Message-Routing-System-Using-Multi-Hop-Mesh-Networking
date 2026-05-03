@@ -26,6 +26,7 @@ This document is a deep technical reference for the DisasterMesh application. It
 16. [Permissions & Platform Configuration](#16-permissions--platform-configuration)
 17. [Wire Formats](#17-wire-formats)
 18. [Deduplication Strategy](#18-deduplication-strategy)
+19. [Meshtastic — Deep Technical Reference](#19-meshtastic--deep-technical-reference)
 
 ---
 
@@ -1569,6 +1570,555 @@ for (const id of payload.seenIds)
   expanded.add(id.replace(/-/g,'').slice(0,8).toLowerCase());
 state.seenIds = Array.from(expanded);                              // Convert back to array for Redux storage
 ```
+
+---
+
+## 19. Meshtastic — Deep Technical Reference
+
+This section documents how the Meshtastic firmware and protocol work end-to-end. It is intended to give any engineer a complete mental model of what the radio is doing when DisasterMesh writes to the GATT `ToRadio` characteristic and reads from `FromRadio`. Sources: [meshtastic.org/docs/overview](https://meshtastic.org/docs/overview/) and [github.com/meshtastic/firmware](https://github.com/meshtastic/firmware).
+
+---
+
+### 19.1 What Meshtastic Is
+
+Meshtastic is an open-source, long-range, low-power mesh radio system built on LoRa (Long Range) modulation. It turns cheap ESP32 / nRF52 developer boards fitted with a LoRa radio chip into autonomous multi-hop mesh nodes that need **no internet, no cellular, and no central server**. Every node relays every message it hears — the network is fully decentralised.
+
+```
+[Phone A] ──BLE GATT──► [Meshtastic Node 1] ──LoRa──► [Meshtastic Node 2] ──LoRa──► [Meshtastic Node 3] ──BLE GATT──► [Phone B]
+                          (your phone's BLE                (relay node,                  (relay node,                    (recipient's
+                           gateway device)                  no phone needed)              no phone needed)                 phone)
+```
+
+Key characteristics:
+- **Range**: 5–20 km line-of-sight, up to 331 km in documented record tests
+- **Bandwidth**: 0.18–21.88 kbps depending on preset
+- **Topology**: Peer-to-peer flood mesh, no master node
+- **Power**: Nodes can run for days/weeks on a single battery charge
+- **Frequency**: 433 MHz / 868 MHz (EU), 915 MHz (US/AU), 2.4 GHz (SX128x chipset)
+
+---
+
+### 19.2 LoRa Physical Layer (Layer 0)
+
+LoRa (Long Range) is a proprietary chirp spread-spectrum modulation by Semtech. Understanding its parameters is essential for understanding why Meshtastic behaves the way it does.
+
+#### 19.2.1 Spreading Factor (SF)
+
+The spreading factor controls how many chirp symbols represent one data bit. It is a 3-bit field ranging from SF5 to SF12.
+
+| SF | Chips/Symbol | Data Rate (125 kHz BW) | Link Budget gain vs SF7 |
+|----|-------------|----------------------|------------------------|
+| SF7  | 128   | ~5.47 kbps  | baseline |
+| SF8  | 256   | ~3.13 kbps  | +2.5 dB |
+| SF9  | 512   | ~1.76 kbps  | +5.0 dB |
+| SF10 | 1024  | ~0.98 kbps  | +7.5 dB |
+| SF11 | 2048  | ~0.54 kbps  | +10.0 dB |
+| SF12 | 4096  | ~0.29 kbps  | +12.5 dB |
+
+**Rule:** each step up in SF doubles airtime on the air and adds ~2.5 dB of link budget (range). SF5 and SF6 require 2nd-generation chips (SX126x, LR11xx, SX128x); first-generation chips (SX127x / RFM95) are limited to SF7–SF12.
+
+#### 19.2.2 Bandwidth (BW)
+
+Bandwidth is the frequency span of the chirp. Wider bandwidth = faster data rate but reduced range.
+
+- **Rule:** doubling bandwidth reduces link budget by ~3 dB
+- **Values below 31 kHz** require a high-quality temperature-compensated oscillator (TCXO)
+- Meshtastic presets commonly use 125 kHz, 250 kHz, or 500 kHz
+
+#### 19.2.3 Coding Rate (CR)
+
+Forward error correction overhead added to the LoRa symbols.
+
+| Coding Rate | Overhead multiplier |
+|-------------|-------------------|
+| 4/5 | 1.25× |
+| 4/6 | 1.50× |
+| 4/7 | 1.75× |
+| 4/8 | 2.00× |
+
+Higher coding rate = more redundancy = more reliable in noisy environments, at the cost of longer airtime.
+
+#### 19.2.4 Preamble Length
+
+Meshtastic uses a preamble of **16 symbols** (standard LoRa uses 8). The extra symbols allow nodes to wake from light sleep before the payload arrives — critical for battery-powered relay nodes that sleep between packets.
+
+#### 19.2.5 Sync Word
+
+Meshtastic uses sync word `0x2B` to distinguish its traffic from other LoRa networks sharing the same frequency band. Packets with a different sync word are ignored at the radio layer.
+
+---
+
+### 19.3 Radio Presets
+
+Meshtastic ships with 8 named presets. These cover the full spectrum from "maximum range, very slow" to "short range, very fast":
+
+| Preset | SF | BW (kHz) | CR | Data Rate | Link Budget | Typical Use |
+|--------|----|-----------|----|-----------|-------------|-------------|
+| Short Turbo | 7 | 500 | 4/5 | 21.88 kbps | 140 dB | Indoor, dense urban |
+| Short Fast | 7 | 250 | 4/5 | 10.94 kbps | 143 dB | Short range, low latency |
+| Short Slow | 8 | 250 | 4/5 | ~5.5 kbps | 145 dB | Short range, moderate |
+| Medium Fast | 9 | 250 | 4/5 | ~3.0 kbps | 148 dB | Suburban |
+| Medium Slow | 10 | 250 | 4/5 | ~1.7 kbps | 150 dB | Suburban extended |
+| **Long Fast** | **11** | **250** | **4/5** | **1.07 kbps** | **153 dB** | **Default — best balance** |
+| Long Moderate | 11 | 125 | 4/8 | ~0.34 kbps | 156 dB | Rural, long range |
+| Long Slow | 12 | 125 | 4/8 | ~0.18 kbps | 158.5 dB | Maximum range |
+
+**Long Fast (SF11, 250 kHz, 4/5)** is the factory default. It gives ~5 km typical range in an urban environment with a simple antenna, and supports ~104 frequency slots in the US 915 MHz band.
+
+The 331 km ground-to-ground world record used **Long Slow** (SF12, 62.5 kHz, 4/8, 868 MHz) with directional antennas — demonstrating the extreme end of what LoRa can achieve with maximum link budget.
+
+---
+
+### 19.4 Regional Frequency Bands
+
+Every Meshtastic node must be configured with its regulatory region. The region determines the legal frequency band, maximum transmit power, number of channel slots, and duty cycle.
+
+| Region | Band | Max Power | Duty Cycle | Slots | Default slot |
+|--------|------|-----------|-----------|-------|--------------|
+| EU 433 | 433–434 MHz | +10 dBm ERP | None | 4 | 4 → 433.875 MHz |
+| EU 868 | 869.40–869.65 MHz | +27 dBm ERP | **10%** | 1 | 1 → 869.525 MHz |
+| US (ANZ) | 902–928 MHz | +30 dBm ERP | None | 104 | 0 → hashed to slot 20 → 906.875 MHz |
+
+The **EU 868 10% duty cycle** is legally binding — firmware enforces it by measuring airtime and refusing to transmit if the limit would be exceeded. This is why EU nodes can appear to "go silent" under heavy load.
+
+**Channel frequency formula:**
+```
+f = region_start + bandwidth_offset + (channel_index × channel_spacing)
+```
+
+---
+
+### 19.5 Packet Structure (On-Air Format)
+
+Every Meshtastic over-the-air packet has a fixed 16-byte unencrypted header followed by up to 237 bytes of AES-encrypted payload. Maximum total packet size: **256 bytes** (LoRa hardware limit with this configuration).
+
+```
+Offset  Length  Field
+──────────────────────────────────────────────────────────────
+0x00    4 bytes  Destination NodeID   (0xFFFFFFFF = broadcast)
+0x04    4 bytes  Sender NodeID        (bottom 4 bytes of MAC)
+0x08    4 bytes  Packet ID            (32-bit, used for dedup + ACK)
+0x0C    1 byte   Flags:
+                   bits 0-2  HopLimit  (0-7, decremented each relay hop)
+                   bit  3    WantAck   (1 = request explicit ACK)
+                   bit  4    ViaMQTT   (1 = arrived via internet bridge)
+                   bits 5-7  HopStart  (original hop limit, for routing decisions)
+0x0D    1 byte   Channel hash         (xor of channel name and PSK; aids key lookup)
+0x0E    1 byte   Next-hop relay node  (for next-hop routing; 0 = flood)
+0x0F    1 byte   Relay node ID        (last relayer's node ID fragment)
+0x10    0–237 bytes  Encrypted payload (AES-256-CTR, see §19.7)
+──────────────────────────────────────────────────────────────
+```
+
+**NodeID** is derived from the bottom 4 bytes of the device's hardware MAC address — each node has a globally unique number without any registration. The broadcast address `0xFFFFFFFF` means every node in range should process the packet.
+
+---
+
+### 19.6 Protobuf Message Hierarchy
+
+The encrypted payload is a serialised Protocol Buffer message. Meshtastic's full proto schema is at [buf.build/meshtastic/protobufs](https://buf.build/meshtastic/protobufs). The subset relevant to text messaging:
+
+```
+ToRadio                        # phone → radio (written to GATT ToRadio characteristic)
+  field 1: MeshPacket packet   # a packet to transmit
+  field 3: uint32 want_config_id  # request full NodeDB dump (handshake)
+
+FromRadio                      # radio → phone (read from GATT FromRadio characteristic)
+  field 2: MeshPacket packet   # a received packet
+  field 3: MyNodeInfo my_info  # our own node number
+  field 4: NodeInfo node_info  # one entry from NodeDB
+  field 7: uint32 config_complete_id  # echoes want_config_id when dump is done
+
+MeshPacket
+  field 1:  fixed32  from         # sender node number
+  field 2:  fixed32  to           # destination (0xFFFFFFFF = broadcast)
+  field 3:  uint32   channel      # 0 = primary channel
+  field 4:  Data     decoded      # plaintext payload (oneof payload_variant)
+  field 6:  fixed32  id           # packet ID
+  field 9:  uint32   hop_limit    # remaining hops (firmware field; 3 = default)
+  field 10: bool     want_ack     # request ACK
+
+Data
+  field 1: uint32 portnum   # application port (TEXT_MESSAGE_APP=1, NODEINFO_APP=4, ...)
+  field 2: bytes  payload   # portnum-specific payload bytes
+
+MyNodeInfo
+  field 1: uint32 my_node_num   # this device's node number
+
+NodeInfo
+  field 1: uint32 num           # node number
+  field 4: User   user          # human-readable info
+
+User
+  field 1: string id            # "!<hex>" format ID
+  field 2: string long_name     # e.g. "Alice's T-Beam"
+  field 3: string short_name    # 4-char callsign e.g. "ALCE"
+```
+
+**Port numbers** route the decrypted `Data.payload` to the correct firmware module:
+
+| PortNum | Value | Handler module |
+|---------|-------|----------------|
+| TEXT_MESSAGE_APP | 1 | TextMessageModule — delivers to connected phone as chat |
+| ADMIN_APP | 2 | AdminModule — device configuration |
+| POSITION_APP | 3 | PositionModule — GPS broadcast |
+| NODEINFO_APP | 4 | NodeInfoModule — presence/identity (our warm-up beacon uses this) |
+| ROUTING_APP | 5 | RoutingModule — ACK/NAK packets |
+| TELEMETRY_APP | 6 | TelemetryModule — battery/sensor data |
+| WAYPOINT_APP | 7 | WaypointModule |
+| RANGE_TEST_APP | 8 | RangeTestModule |
+| STORE_FORWARD_APP | 9 | StoreForwardModule |
+| NEIGHBORINFO_APP | 10 | NeighborInfoModule |
+
+---
+
+### 19.7 Encryption
+
+#### 19.7.1 Channel Encryption — AES-256-CTR
+
+Every channel has a **Pre-Shared Key (PSK)** shared out-of-band (via QR code or manual entry). Meshtastic encrypts the `Data` payload using **AES in Counter (CTR) mode** with that PSK.
+
+The **nonce** (initialisation vector) is constructed entirely from unencrypted header fields — no separate IV field is transmitted:
+
+```
+Nonce construction (128 bits total):
+  Upper 96 bits:  Packet ID (32 bits) || Sender NodeNum (32 bits) || 0x00000000 (32 bits padding)
+  Lower 32 bits:  AES-CTR block counter (increments per 16-byte block)
+```
+
+This means:
+- Two packets with the same ID from the same sender will use the same keystream — a known security limitation
+- Only ~31 random bits of entropy per reboot (IV reuse risk mitigated by per-node uniqueness via MAC)
+
+**Default primary channel PSK** (`AQ==` in base64 = `0x01` padded) is publicly known. Any network that hasn't changed this key is effectively unencrypted in practice. Changing the PSK is the single most important security action.
+
+The **channel hash** (1 byte in the unencrypted header) is computed as `XOR(channel_name_bytes, PSK_bytes)`. Receiving nodes use it to quickly identify which channel's key to try before attempting full AES decryption.
+
+#### 19.7.2 Direct Message Encryption (v2.5.0+)
+
+Direct (unicast) messages between two nodes use **X25519 Elliptic Curve Diffie-Hellman** key exchange:
+- Each node generates a permanent X25519 key pair on first boot
+- The sender encrypts with the recipient's **public key** using **AES-CCM** (authenticated encryption)
+- The sender signs with their own **private key** (XEdDSA, Signal-protocol-derived)
+- The recipient verifies the signature and decrypts
+
+This provides **authenticity** for direct messages that channel broadcast encryption lacks.
+
+#### 19.7.3 Documented Encryption Limitations
+
+Meshtastic explicitly documents these limitations:
+
+| Property | Channel encryption | Direct messages |
+|----------|-------------------|-----------------|
+| Confidentiality | ✓ AES-256-CTR | ✓ AES-CCM |
+| Authenticity (who sent it) | ✗ None | ✓ XEdDSA signature |
+| Integrity (message unchanged) | ✗ None (AES-CTR is malleable) | ✓ AEAD |
+| Perfect Forward Secrecy | ✗ Static PSK | ✗ Static key pairs |
+| Replay protection | ✗ No | ✓ Session IDs |
+
+**AES-CTR malleability**: an attacker who knows the plaintext can flip bits in the ciphertext to produce predictable changes in the decrypted output. No HMAC/MAC is appended. This is issue [#4030](https://github.com/meshtastic/Meshtastic-device/issues/4030) in the firmware tracker.
+
+**"Harvest now, decrypt later"**: recorded ciphertext can be decrypted retroactively if the PSK is ever leaked. AES-256 is considered quantum-resistant but the X25519 key exchange is not.
+
+**NodeDB spoofing window**: embedded hardware caps the NodeDB at **100 nodes**. When this is exceeded, the oldest unseen nodes are evicted. An attacker can create 100 fake nodes to force eviction of a legitimate node, then impersonate it during the window before the real node re-announces itself. Favourite nodes are never evicted as a mitigation.
+
+---
+
+### 19.8 Mesh Routing Algorithm
+
+#### 19.8.1 Protocol Layers
+
+Meshtastic implements a 4-layer protocol stack on top of raw LoRa:
+
+```
+Layer 3 — Multi-hop routing     (managed flood + next-hop for direct)
+Layer 2 — Reliable zero-hop     (WantAck + retransmit for single-hop)
+Layer 1 — Unreliable zero-hop   (best-effort single transmission)
+Layer 0 — LoRa physical         (preamble=16, sync=0x2B, AES payload)
+```
+
+#### 19.8.2 Managed Flooding (Broadcasts)
+
+Broadcast messages (destination = `0xFFFFFFFF`) use **managed flooding**:
+
+1. Originating node transmits with `HopLimit = N` (typically 3, max 7).
+2. Every receiving node that has **not** seen this Packet ID before:
+   a. Decrements `HopLimit` by 1.
+   b. If `HopLimit > 0`, re-broadcasts after a random **contention window** delay.
+   c. Records the Packet ID in a `PacketHistory` table to prevent re-processing.
+3. When `HopLimit` reaches 0, nodes receive but do not re-broadcast.
+
+**Contention window** (CSMA/CA-inspired):
+- Nodes with **lower SNR** (weaker received signal = further from sender) get a **smaller** contention window and therefore transmit first.
+- Nodes close to the sender wait longer — their re-broadcast is less valuable since the sender's signal already reached nearby nodes.
+- Window size scales with channel utilisation to reduce collisions under heavy load.
+
+```
+contention_delay = base_delay × f(channel_utilisation) × g(1 / SNR)
+```
+
+**ROUTER and REPEATER** roles receive higher rebroadcast priority (smaller contention window) regardless of SNR, because they are deployed specifically to extend coverage.
+
+#### 19.8.3 Duplicate Detection — PacketHistory
+
+Each node maintains a `PacketHistory` table of recently seen `(sender_node_id, packet_id)` pairs. Each entry is 20 bytes:
+
+```
+struct PacketHistoryEntry {
+  uint32_t sender_node_id;   // 4 bytes
+  uint32_t packet_id;        // 4 bytes
+  uint32_t rx_timestamp;     // 4 bytes
+  uint8_t  hop_limit_bits;   // 1 byte (6 bits: highest observed + transmitted)
+  uint8_t  relay_nodes[6];   // 6 bytes: up to 6 relaying node IDs (1 byte each, truncated)
+  uint8_t  padding;          // 1 byte
+};
+```
+
+`wasSeenRecently()` checks this table before re-broadcasting. Entries are pruned automatically after the maximum propagation time for the current radio preset elapses.
+
+#### 19.8.4 Next-Hop Routing (Direct Messages, v2.6+)
+
+For direct (unicast) messages Meshtastic learns and caches the best relay path:
+
+1. **First delivery**: flood as normal, `NextHop` field = 0.
+2. When an ACK returns successfully, the originating node records the **relay node** that forwarded the ACK as the preferred next hop.
+3. **Subsequent messages**: the `NextHop` field in the header is set to the cached relay node ID. Only that specific relay node will re-broadcast; all other nodes that hear the packet ignore it.
+4. **Fallback**: on the final retransmission attempt (`NUM_RELIABLE_RETX = 3`), if no ACK was received the packet falls back to managed flooding (next-hop cleared).
+
+This dramatically reduces unnecessary re-broadcasts in an established mesh compared to pure flooding.
+
+#### 19.8.5 Acknowledgment System
+
+```
+WantAck = 1  →  recipient sends ACK packet (PortNum = ROUTING_APP = 5)
+           →  ACK contains original packet ID in its payload
+           →  sender marks message as "delivered" on receiving the ACK
+           →  if no ACK after timeout, sender retransmits (max 3 times)
+
+WantAck = 0  →  for broadcasts, "implicit ACK" — sender listens for
+                a re-broadcast of its own packet; if heard, delivery is assumed
+```
+
+Intermediate relay nodes: **2 retransmission attempts** (`NUM_INTERMEDIATE_RETX`).
+Original senders: **3 retransmission attempts** (`NUM_RELIABLE_RETX`).
+
+#### 19.8.6 Adaptive Scaling for Large Meshes (v2.4.0+)
+
+When a mesh has more than 40 online nodes, broadcast intervals scale up automatically to prevent channel saturation:
+
+```
+ScaledInterval = BaseInterval × (1.0 + (OnlineNodes − 40) × 0.075)
+```
+
+Example with 62 nodes online:
+- Telemetry base interval: 30 minutes
+- Scaled: 30 × (1.0 + (62 − 40) × 0.075) = 30 × 2.65 ≈ **79.5 minutes**
+
+Default broadcast intervals (before scaling):
+
+| Broadcast type | Config key | Base interval |
+|----------------|-----------|---------------|
+| Device telemetry | `telemetry.device_update_interval` | 30 min |
+| Position (smart) | `position.position_broadcast_secs` | 15 min |
+| NodeInfo/identity | `device.node_info_broadcast_secs` | 3 hours |
+
+---
+
+### 19.9 BLE GATT API (Phone ↔ Firmware)
+
+The phone communicates with the Meshtastic firmware exclusively via four GATT characteristics on a single BLE service. This is the interface DisasterMesh uses in `services/meshtastic.service.ts`.
+
+#### Service UUID
+```
+6ba1b218-15a8-461f-9fa8-5dcae273eafd
+```
+
+#### Characteristics
+
+| Characteristic | UUID | Direction | Operation |
+|----------------|------|-----------|-----------|
+| **ToRadio** | `f75c76d2-129e-4dad-a1dd-7866124401e7` | Phone → Radio | WRITE (with or without response) |
+| **FromRadio** | `2c55e69e-4993-11ed-b878-0242ac120002` | Radio → Phone | READ (poll) |
+| **FromNum** | `ed9da18c-a800-4f66-a670-aa7547e34453` | Radio → Phone | NOTIFY (interrupt-driven) |
+| **LogRadio** | `5a3d6e49-06e6-4423-9944-e9de8cdf9547` | Radio → Phone | READ/NOTIFY (debug logs) |
+
+**Protocol flow:**
+```
+1. Phone subscribes to FromNum NOTIFY before any write (avoids race condition)
+2. Phone writes ToRadio{want_config_id: nonce}  →  requests full NodeDB dump
+3. Radio sends a series of FromRadio frames:
+      FromRadio{my_info}       → gives phone our own node number
+      FromRadio{node_info} × N → one frame per node in NodeDB
+      FromRadio{config_complete_id: nonce}  → signals end of dump
+4. Phone polls FromRadio READ after each FromNum NOTIFY to drain the queue
+5. Phone writes ToRadio{packet: MeshPacket} to send a message over LoRa
+6. Incoming LoRa packets trigger a FromNum NOTIFY → phone polls FromRadio
+```
+
+**MTU constraint**: BLE MTU is typically 512 bytes, matching the Meshtastic maximum packet size. Each `FromRadio` / `ToRadio` write must fit within one MTU — the firmware asserts this at compile time.
+
+**Write variants**: `writeWithResponse` (GATT write with ACK from firmware) is preferred; some firmware revisions only support `writeWithoutResponse` on ToRadio, so `MeshtasticService.writeRaw()` falls back automatically.
+
+**FromRadio polling pattern**: the firmware queues outgoing frames and notifies `FromNum` once per queued frame (not once per burst). The phone must loop-read `FromRadio` until it returns an empty response (0 bytes), then stop. DisasterMesh caps this loop at 8 frames during steady state (to avoid starving the BLE scan loop) and 100 frames during the initial config dump.
+
+---
+
+### 19.10 NodeDB — Peer Discovery and Tracking
+
+The NodeDB is the firmware's in-memory (and flash-persisted) directory of every node ever heard on the mesh.
+
+**Per-node record:**
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `num` | uint32 | Node number (from MAC) |
+| `user.long_name` | string | Human name e.g. "Alice's T-Beam" |
+| `user.short_name` | string | 4-char callsign e.g. "ALCE" |
+| `user.hw_model` | enum | Hardware variant (TBEAM, RAK4631, etc.) |
+| `position` | struct | lat/lon/alt, last GPS fix |
+| `last_heard` | uint32 | Unix timestamp of last packet from this node |
+| `snr` | float | SNR of last received packet |
+| `device_metrics` | struct | Battery %, voltage, channel utilisation, airtime |
+| `role` | enum | CLIENT / ROUTER / ROUTER_CLIENT / REPEATER |
+| `is_favorite` | bool | Never evicted; used for preferred routing |
+
+**Capacity:** 100 nodes on embedded hardware. When full, the node least recently heard (that is not a favourite) is evicted to make room. Mobile clients (Android/iOS app) can store far more.
+
+**NodeID format:** displayed as `!` followed by the node number in hex (e.g. `!a3b4c5d6`). DisasterMesh uses this fallback name when a `long_name` is not yet in the local NodeNames map.
+
+**Discovery:** node identity is broadcast periodically as a `NODEINFO_APP` (port 4) packet. Firmware re-broadcasts this on a 3-hour cycle (`node_info_broadcast_secs`). DisasterMesh's warm-up beacon (`_sendBeacon()`) sends an empty `NODEINFO_APP` packet immediately after the BLE handshake to register itself in every nearby node's NodeDB before sending its first real message.
+
+---
+
+### 19.11 Channel System
+
+Meshtastic supports up to **8 logical channels** per radio. All channels share the same LoRa parameters (frequency, SF, BW) — they are differentiated only by name and PSK. The channel hash in the packet header lets receivers identify which PSK to try without decrypting with each key.
+
+```
+channel_hash = XOR(channel_name_bytes, PSK_bytes)  →  1-byte result stored in header
+```
+
+**Channel roles:**
+- `PRIMARY` — exactly one per device; controls the LoRa radio parameters
+- `SECONDARY` — additional encrypted "sub-channels" overlaid on the same frequency
+- `DISABLED` — slot unused
+
+**Well-known built-in channels:**
+
+| Name | Purpose |
+|------|---------|
+| Default / LongFast | Primary chat channel (publicly known PSK — change for security) |
+| Admin | Device administration (hardened PSK, different from chat) |
+| GPIO | Remote GPIO control |
+| Serial | Serial port bridge |
+| MQTT | Internet bridge proxy |
+
+**Channel sharing** is done via QR code or URL that encodes the channel name + PSK. Any node that scans the same QR code joins the same encrypted sub-network.
+
+---
+
+### 19.12 Device Roles
+
+| Role | Behaviour | Power | Use case |
+|------|-----------|-------|----------|
+| **CLIENT** | Participates in mesh; relays messages | Normal | Personal handheld device |
+| **CLIENT_MUTE** | Receives only; does not relay | Low | Listen-only observer |
+| **ROUTER** | Always-on relay; higher rebroadcast priority | High | Fixed infrastructure node |
+| **ROUTER_CLIENT** | Router when standalone; Client when phone connected | Medium | Solar-powered deployment |
+| **REPEATER** | Relay only; does not generate user traffic | Very high | Pure infrastructure extender |
+| **TRACKER** | Broadcasts GPS frequently; minimal receive | Low | Asset/vehicle tracking |
+| **SENSOR** | Broadcasts telemetry; minimal relay | Low | Environmental sensor node |
+
+Routers receive a **smaller contention window** in the managed flooding algorithm, so their rebroadcasts win the CSMA/CA race and propagate further in the mesh before CLIENT nodes retransmit the same packet.
+
+---
+
+### 19.13 Firmware Architecture
+
+The Meshtastic firmware is structured as a layered C++ application running on FreeRTOS (ESP32/nRF52) or bare-metal (RP2040). Key subsystems:
+
+```
+┌─────────────────────────────────────────────────────┐
+│  Application Modules (TextMessage, Position,         │
+│  Telemetry, NodeInfo, Admin, StoreForward …)        │
+├─────────────────────────────────────────────────────┤
+│  MeshService  — central coordinator, queuing,        │
+│                 position updates, phone API         │
+├──────────────────────────┬──────────────────────────┤
+│  Router subsystem        │  PhoneAPI                │
+│  (FloodingRouter,        │  (BLE/Serial/WiFi/HTTP)  │
+│   ReliableRouter,        │                          │
+│   NextHopRouter,         │                          │
+│   PacketHistory)         │                          │
+├──────────────────────────┴──────────────────────────┤
+│  RadioInterface (RF95 / SX126x / SX128x / LR11xx)  │
+├─────────────────────────────────────────────────────┤
+│  CryptoEngine  (AES-256-CTR / X25519 / AES-CCM)    │
+├─────────────────────────────────────────────────────┤
+│  NodeDB   │  Channels   │  PowerFSM   │  GPS        │
+├─────────────────────────────────────────────────────┤
+│  Platform HAL (ESP32 / nRF52 / RP2040 / Linux)     │
+└─────────────────────────────────────────────────────┘
+```
+
+**Router class hierarchy:**
+```
+Router (base — packet queue, module dispatch, duty cycle)
+  └── FloodingRouter (naive broadcast flood with dedup)
+        └── ReliableRouter (WantAck + retransmit for direct)
+              └── NextHopRouter (path learning, single relay designation)
+```
+
+**Thread model:** FreeRTOS with up to `MAX_THREADS = 40` threads. NimBLE callbacks run in a separate task; a mutex protects NodeDB and shared state.
+
+**Module dispatch:** every received packet passes through `MeshModule::callModules()`, which iterates all registered modules. Each module implements `wantPacket(portnum)` to filter and `handleReceived()` to process.
+
+**MeshService queues:**
+- `meshPacketsForPhone` — packets to be sent to the connected phone app
+- `queueStatusPackets` — queue depth notifications
+- `mqttProxyPackets` — packets bridged via MQTT
+- `clientNotifications` — phone alerts
+
+**PowerFSM:** finite state machine managing sleep/wake transitions. The 16-symbol preamble ensures nodes can wake from light sleep in time to receive a packet. Deep sleep between broadcast intervals dramatically extends battery life.
+
+---
+
+### 19.14 Range Tests and Real-World Performance
+
+The following records demonstrate the physical limits of Meshtastic LoRa:
+
+**Ground-to-Ground record: 331 km** (MartinR7 & alleg, 868 MHz)
+- Preset: Long Slow (SF12, BW 62.5 kHz, CR 4/8)
+- Hardware: RAK4631 + RAK19003 mini base board
+- Antenna A: 55 cm collinear 868 MHz outdoor antenna
+- Antenna B: RAKARJ17 868 MHz antenna
+- Link budget: ~158.5 dB
+
+**Previous record: 254 km** (kboxlabs, 915 MHz)
+- Preset: Long Fast (SF11, BW 250 kHz, CR 4/8)
+- Hardware: RAK4631 + RAK 5005-O
+- Antenna: 5.8 dBi outdoor omnidirectional
+
+**Ground-to-Air record: 206 km** (StarWatcher et al., 915 MHz)
+- Preset: Long Fast (SF11, BW 250 kHz, CR 4/8)
+- Hardware: LILYGO TTGO T-Beam v1.1 (×2, stock antennas, one balloon-deployed)
+
+These records confirm that with appropriate antenna and line-of-sight geometry, a **single LoRa hop** can cover distances that would require a full cellular tower. In a mesh deployment with 3 hops this translates to potential end-to-end coverage of hundreds of kilometres with no infrastructure.
+
+---
+
+### 19.15 How DisasterMesh Uses Meshtastic
+
+Summarising how the sections above relate to DisasterMesh's `services/meshtastic.service.ts`:
+
+| DisasterMesh action | Meshtastic mechanism |
+|---------------------|---------------------|
+| `connect(deviceId)` | Subscribe FromNum NOTIFY → write `want_config_id` → drain `FromRadio` until `config_complete_id` matches → populate `nodeNames` map from `NodeInfo` frames |
+| `_sendBeacon()` | Encode empty `NODEINFO_APP` (port 4) `MeshPacket` → write `ToRadio` → warms NodeDB on all nearby nodes so first real message is not cold-start |
+| `sendText(text)` | Encode `Data{portnum=1, payload=UTF8(text)}` → encode `MeshPacket{to=0xFFFFFFFF, hop_limit=3, want_ack=false}` → encode `ToRadio{packet}` → GATT write |
+| `_scheduleDrain()` | Coalesces `FromNum` notifications → calls `_drainFromRadio()` → loop-reads `FromRadio` until empty (max 8 frames in steady state) |
+| `_handleFromRadio()` | Decodes `FromRadio` protobuf → routes `field 2 (packet)` to `onTextMessage` callback if `portnum=1` and `from ≠ myNodeNum` |
+| Hand-rolled protobuf | Avoids `@meshtastic/protobufs` ESM package (Metro bundler incompatible in release builds); encodes only the subset of fields needed for text messaging |
 
 ---
 
