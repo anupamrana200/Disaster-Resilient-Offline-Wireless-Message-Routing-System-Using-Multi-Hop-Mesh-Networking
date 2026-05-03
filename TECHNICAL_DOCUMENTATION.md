@@ -2122,6 +2122,86 @@ Summarising how the sections above relate to DisasterMesh's `services/meshtastic
 
 ---
 
+### 19.16 DisasterMesh and the LongFast Preset — What Is and Isn't Used
+
+Meshtastic nodes connected to DisasterMesh are expected to be running the **LongFast** preset (the factory default on every new Meshtastic device). DisasterMesh never sends a `Config.LoRaConfig` message to the radio — it trusts the hardware's existing configuration. This section documents exactly which Meshtastic features the app actively uses, which it relies on passively, and which it deliberately skips.
+
+#### Radio Preset — LongFast (the default)
+
+LongFast is chosen because it offers the best balance of range and throughput for disaster-scenario text messaging where nodes may be kilometres apart.
+
+| Parameter | LongFast value | What it means for DisasterMesh |
+|-----------|---------------|-------------------------------|
+| Spreading Factor | SF11 | 2 048 chips/symbol — excellent sensitivity (−148 dBm), moderate air-time |
+| Bandwidth | 250 kHz | Double the common 125 kHz; halves time-on-air vs SF11/125 kHz |
+| Coding Rate | 4/5 | Lightest FEC — maximises throughput, tolerates moderate interference |
+| Bit rate (effective) | ≈ 1.07 kbps | Enough for ~400-character messages in < 3 s of air-time |
+| Max typical range | 5–15 km line-of-sight | Covers a city neighbourhood or small town without infrastructure |
+| Region assumed | IN865 (868 MHz ISM, India) | 1 % duty-cycle limit; LongFast's short packets stay well inside it |
+
+> **Why not LongSlow or VeryLongSlow?** SF12 doubles air-time and halves channel capacity. At disaster scale (many nodes, burst traffic) the medium fills faster than nodes can clear it. LongFast keeps each packet under ~2.5 s, leaving room for several simultaneous senders before CSMA/CA collisions dominate.
+
+---
+
+#### Features DisasterMesh **Actively Uses**
+
+These are features where `meshtastic.service.ts` explicitly encodes, sends, or decodes a protobuf field.
+
+| Feature | Where in code | Detail |
+|---------|--------------|--------|
+| **BLE GATT transport** | `getBLEService().writeRaw / readRaw / monitorRaw` | All communication is over the 4 Meshtastic GATT characteristics; no TCP/IP or serial |
+| **`want_config_id` handshake** | `connect()` → `encodeToRadioWantConfig(nonce)` | Triggers full NodeDB dump from the radio so node names are known before first send |
+| **`config_complete_id` detection** | `_drainFromRadio(nonce)` → field 7 match | Handshake completion signal; app waits up to 5 s for it |
+| **NodeInfo decode** | `_handleFromRadio()` → field 4 → `User.long_name` | Populates `nodeNames` map — shown as `fromName` on incoming messages |
+| **`MyNodeInfo` decode** | `_handleFromRadio()` → field 3 → field 1 | Stores `myNodeNum`; used to filter out echoes of own transmissions |
+| **TEXT_MESSAGE_APP (port 1) send** | `sendText()` → `encodeData(PORT_TEXT, utf8)` | All user messages and SOS payloads go out on port 1 |
+| **NODEINFO_APP (port 4) beacon** | `_sendBeacon()` → `encodeData(PORT_NODEINFO, empty)` | Warm-up broadcast after connect so first real message isn't lost |
+| **Broadcast destination** | `to: 0xFFFFFFFF` in every `MeshPacket` | All messages are mesh-wide floods — no directed/unicast routing attempted |
+| **`hop_limit = 3`** | `encodeMeshPacket({ hopLimit: 3 })` | Up to 3 relay hops; balances reach vs. channel congestion |
+| **`want_ack = false`** | `encodeMeshPacket({ wantAck: false })` | Broadcast ACK storms avoided; delivery relies on managed flooding |
+| **Primary channel (channel 0)** | `channel: 0` omitted (proto3 default) | Always uses the radio's pre-configured primary channel |
+| **FromNum NOTIFY** | `getBLEService().monitorRaw(…FROMNUM_UUID…)` | Interrupt-driven receive — app wakes only when new packets arrive |
+| **Drain coalescing** | `_scheduleDrain()` / `drainPending` flag | Prevents BLE-advertiser starvation when notification storms hit |
+
+---
+
+#### Features DisasterMesh **Passively Relies On** (firmware does the work)
+
+These features are provided by the Meshtastic firmware running on the connected hardware. DisasterMesh benefits from them without implementing them itself.
+
+| Feature | Firmware behaviour | Benefit to DisasterMesh |
+|---------|--------------------|------------------------|
+| **Managed flooding** | Each node rebroadcasts once per packet ID within hop budget | Messages self-propagate across multi-hop mesh without routing tables |
+| **CSMA/CA contention** | Random back-off before TX using SNR-weighted window | Multiple phones sending simultaneously don't collide; channel stays usable |
+| **Packet deduplication** | Firmware's 20-entry `PacketHistory` drops repeated `packet_id` | Relay loops suppressed; DisasterMesh only needs to dedup at application layer |
+| **AES-256-CTR encryption** | Firmware encrypts every over-the-air packet with channel PSK | All DisasterMesh traffic is encrypted end-to-end over LoRa without app effort |
+| **Channel PSK** | Pre-shared key baked into channel config on the device | DisasterMesh doesn't manage keys; nodes must share the same channel config |
+| **NodeDB** | Firmware maintains a 100-node table of seen peers | App can decode `NodeInfo` frames to get human-readable names; no separate discovery needed |
+| **Hop counting** | Firmware decrements `hop_limit` each relay; drops at 0 | `hop_limit=3` naturally limits storm radius without app-side enforcement |
+| **Duty-cycle compliance** | Firmware enforces regional duty-cycle limits (e.g., 1 % IN865) | App can send freely; radio will queue/drop if legal limit is reached |
+| **LoRa CSMA window** | `CSMA_SLOT_TIME = 8.192 ms` randomised wait | Overlapping BLE-advertiser and LoRa traffic are managed transparently |
+
+---
+
+#### Features DisasterMesh **Does NOT Use**
+
+These are documented Meshtastic capabilities that are intentionally excluded from DisasterMesh to keep the integration simple and resilient.
+
+| Feature | Reason not used |
+|---------|----------------|
+| **Directed / unicast messages** | All sends are broadcast (`to=0xFFFFFFFF`); group-chat model fits disaster broadcast use-case better than point-to-point DMs |
+| **ACK / reliable delivery (`want_ack=true`)** | Would generate per-hop ACK packets, consuming channel capacity; flooding already delivers to all reachable nodes |
+| **Encrypted DMs (X25519 PKI)** | Requires key exchange infrastructure unavailable during disaster; symmetric channel PSK is sufficient |
+| **Telemetry / position packets** | `POSITION_APP` (port 3), `TELEMETRY_APP` (port 67) — DisasterMesh carries GPS coordinates inside the SOS text payload on port 1 instead |
+| **Admin / config writes** | `Config.LoRaConfig`, `Config.ChannelConfig`, etc. — DisasterMesh never reconfigures the radio; nodes must be pre-configured via Meshtastic app |
+| **Multiple channels** | Always uses channel 0 (primary); secondary channels ignored |
+| **Next-hop routing (v2.6+)** | Firmware feature for high-density meshes; DisasterMesh sends to broadcast and lets firmware choose relay strategy |
+| **Store-and-forward server role** | `ROUTER` / `ROUTER_CLIENT` device roles — DisasterMesh implements its own store-and-forward in `services/storage.service.ts` (pending queue) independently of the Meshtastic node role |
+| **MQTT / internet uplink** | Meshtastic nodes can bridge to MQTT over WiFi; DisasterMesh assumes no internet — offline-only operation |
+| **Serial / TCP transports** | Only BLE GATT is used; no native serial or TCP socket to Meshtastic device |
+
+---
+
 ## Appendix — Lifecycle Walk-Through
 
 1. **App start** → `app/_layout.tsx` preloads fonts/images in parallel → hides splash as soon as assets are ready → then calls `setupNotifications()` **fire-and-forget** (not awaited). This ordering ensures the Android 13+ `POST_NOTIFICATIONS` runtime permission dialog does not appear *behind* the splash screen on first install.
