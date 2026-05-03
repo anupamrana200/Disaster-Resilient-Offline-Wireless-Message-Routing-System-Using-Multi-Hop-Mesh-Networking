@@ -17,14 +17,15 @@ This document is a deep technical reference for the DisasterMesh application. It
 7. [Phone-to-Phone BLE Mesh (`PhoneMeshService`)](#7-phone-to-phone-ble-mesh-phonemeshservice)
 8. [Meshtastic LoRa Bridge (`MeshtasticService`)](#8-meshtastic-lora-bridge-meshtasticservice)
 9. [Core Mesh Engine (`useMesh`)](#9-core-mesh-engine-usemesh)
-10. [Storage & Persistence](#10-storage--persistence)
-11. [Notifications](#11-notifications)
-12. [Debug Log Subsystem](#12-debug-log-subsystem)
-13. [UI — Chat / Nodes / Settings Screens](#13-ui--chat--nodes--settings-screens)
-14. [Mock Layer (Expo Go fallback)](#14-mock-layer-expo-go-fallback)
-15. [Permissions & Platform Configuration](#15-permissions--platform-configuration)
-16. [Wire Formats](#16-wire-formats)
-17. [Deduplication Strategy (3-Layer)](#17-deduplication-strategy-3-layer)
+10. [SOS Distress Feature](#10-sos-distress-feature)
+11. [Storage & Persistence](#11-storage--persistence)
+12. [Notifications](#12-notifications)
+13. [Debug Log Subsystem](#13-debug-log-subsystem)
+14. [UI — Chat / Nodes / Settings Screens](#14-ui--chat--nodes--settings-screens)
+15. [Mock Layer (Expo Go fallback)](#15-mock-layer-expo-go-fallback)
+16. [Permissions & Platform Configuration](#16-permissions--platform-configuration)
+17. [Wire Formats](#17-wire-formats)
+18. [Deduplication Strategy](#18-deduplication-strategy)
 
 ---
 
@@ -978,14 +979,212 @@ return {
   messages, pendingCount, nearbyNodes, connectedNodeIds,                    // Live state for UI
   isScanning: nodesSlice.isScanning,    // shared via Redux, not local useBLE state — consistent across screens
   myNodeId, myDisplayName,                                                   // Self identity for header / settings
-  sendMessage, startDiscovery, stopDiscovery,                                // Action API for UI buttons
+  sendMessage,                                                               // Normal text send — returns route token
+  sendSOS,                                                                   // SOS distress send — returns route token or error token
+  startDiscovery, stopDiscovery,                                             // Action API for scan control
   connectToNode, disconnectFromNode,                                         // Per-node connect/disconnect controls
 };
 ```
 
 ---
 
-## 10. Storage & Persistence
+## 10. SOS Distress Feature
+
+The SOS feature lets a user broadcast a distress signal containing their real-time GPS coordinates and battery level over the mesh. It reuses the full existing mesh infrastructure (dual-transport routing, 3-layer dedup, relay, persistence) — no protocol changes were needed.
+
+### 10.1 Wire format — `services/sos.service.ts`
+
+SOS messages are ordinary `Message` objects whose `payload` follows a pipe-delimited format:
+
+```
+SOS|<lat>|<lon>|<accuracy_m>|<battery_pct>
+```
+
+Example: `SOS|22.22888|88.44950|15|34`
+
+- `lat` / `lon` — decimal degrees, 5 decimal places (~1.1 m precision)
+- `accuracy` — GPS horizontal accuracy in metres (0 if unknown)
+- `battery` — sender's battery 0–100 % (0 if `expo-battery` unavailable)
+
+```ts
+export const SOS_PREFIX = 'SOS|';   // Fixed token; receivers branch on this to render the SOS card
+
+export function encodeSOSPayload(lat, lon, accuracyMeters, batteryPercent): string {
+  // 5 decimal places ≈ 1.1 m — enough precision for SAR without blowing the BLE chunk budget
+  const latStr  = lat.toFixed(5);
+  const lonStr  = lon.toFixed(5);
+  const accStr  = String(Math.max(0, Math.round(accuracyMeters || 0)));
+  const battStr = String(Math.max(0, Math.min(100, Math.round(batteryPercent || 0))));
+  return `${SOS_PREFIX}${latStr}|${lonStr}|${accStr}|${battStr}`;
+}
+
+export function parseSOSPayload(payload: string): SOSData | null {
+  if (!isSOSPayload(payload)) return null;
+  const parts = payload.slice(SOS_PREFIX.length).split('|');
+  if (parts.length < 2) return null;
+  const lat = parseFloat(parts[0]);
+  const lon = parseFloat(parts[1]);
+  // Reject NaN and out-of-range coordinates — never render bogus data on a rescue map
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+  if (lat < -90 || lat > 90 || lon < -180 || lon > 180) return null;
+  return { lat, lon,
+    accuracy: Number.isFinite(parseInt(parts[2],10)) ? parseInt(parts[2],10) : 0,
+    battery:  Number.isFinite(parseInt(parts[3],10)) ? parseInt(parts[3],10) : 0,
+  };
+}
+```
+
+Helper utilities in the same file (no external dependencies — pure math):
+
+```ts
+// Haversine formula — great-circle distance in metres between two GPS points
+export function haversineMeters(lat1, lon1, lat2, lon2): number { ... }
+
+// 16-wind compass bearing: 'N', 'NNE', 'NE', ... — shown on receiver's SOS card as direction to victim
+export function bearingLabel(lat1, lon1, lat2, lon2): string { ... }
+
+// Human-readable distance: "420 m" below 1 km, "1.2 km" above
+export function formatDistance(meters): string { ... }
+
+// geo: URL that opens any installed map app (Organic Maps, Google Maps, OsmAnd) at the SOS pin
+// Uses q=lat,lon to drop a visible labelled pin — without q= many apps just pan, no pin shown
+export function buildGeoUrl(lat, lon, label?): string {
+  return `geo:${lat.toFixed(7)},${lon.toFixed(7)}?z=16.0&q=${lat.toFixed(7)},${lon.toFixed(7)}`;
+}
+```
+
+### 10.2 `sendSOS` in `hooks/useMesh.ts`
+
+`sendSOS` is a `useCallback` that acquires a GPS fix and battery level, then calls the existing `sendMessage()`. This means the SOS automatically benefits from Meshtastic-priority routing, phone-mesh fallback, dedup, and the pending queue.
+
+```ts
+const sendSOS = useCallback(async (): Promise<
+  'meshtastic' | 'phone-mesh' | 'queued' | 'no-permission' | 'no-fix'
+> => {
+  // Lazy-require expo-location — avoids crashing on web/Expo Go where the module may be absent
+  const Location = require('expo-location');
+
+  // Step 1 — request foreground location permission (system dialog on Android; cached if already granted)
+  const { status } = await Location.requestForegroundPermissionsAsync();
+  if (status !== 'granted') return 'no-permission';  // Surface to UI so user knows what to fix
+
+  // Step 2 — get a fresh GPS fix with a 20 s hard timeout
+  // High accuracy = GPS chip (works fully offline); 20 s balances responsiveness with disaster reality
+  let loc = null;
+  try {
+    loc = await Promise.race([
+      Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('GPS timeout')), 20_000)),
+    ]);
+  } catch {
+    // Timeout or GPS unavailable — try cached last-known position (slightly stale is better than no SOS)
+    loc = await Location.getLastKnownPositionAsync().catch(() => null);
+    if (!loc) return 'no-fix';
+  }
+
+  // Step 3 — best-effort battery level (expo-battery loaded lazily; SOS still sends with battery=0 if missing)
+  let batteryPct = 0;
+  try {
+    const Battery = require('expo-battery');
+    const lvl = await Battery.getBatteryLevelAsync();
+    if (typeof lvl === 'number' && lvl >= 0) batteryPct = Math.round(lvl * 100);
+  } catch { /* module missing or unavailable — silently fall through */ }
+
+  // Step 4 — encode the SOS payload and dispatch through the normal mesh send path
+  // sendMessage() handles: routing (Meshtastic → phone-mesh → queue), dedup pre-marking,
+  // optimistic Redux insert, status updates, and pending-queue fallback
+  const payload = encodeSOSPayload(
+    loc.coords.latitude, loc.coords.longitude, loc.coords.accuracy ?? 0, batteryPct,
+  );
+  return sendMessage(payload);   // Returns the same route token as a normal send
+}, [sendMessage]);
+```
+
+Return values surface to the UI via the same route-toast component used for normal messages:
+
+| Return value | Meaning |
+|---|---|
+| `'meshtastic'` | SOS transmitted over LoRa via connected Meshtastic node |
+| `'phone-mesh'` | SOS broadcast via BLE advertisement relay chain |
+| `'queued'` | No peers reachable — queued for retry every 10 s |
+| `'no-permission'` | User denied location permission — prompt them to open Settings |
+| `'no-fix'` | GPS timeout AND no cached fix — advise user to go outdoors |
+
+### 10.3 Content-based dedup for SOS (commented out — opt-in)
+
+When both Meshtastic and phone-mesh are active, the same SOS from the same sender can arrive twice within seconds via different transports. A commented-out content-dedup cache in `hooks/useMesh.ts` handles this:
+
+```ts
+// CONTENT-BASED DEDUP — uncomment all three blocks to enable
+// const CONTENT_DEDUP_WINDOW_MS = 2 * 60 * 1000;  // 2-minute dedup window
+//
+// interface ContentDedupEntry { payload: string; ts: number; }
+// const _contentDedup = new Map<string, ContentDedupEntry>();
+//
+// function isDuplicateContent(sourceId: string, payload: string): boolean {
+//   const now = Date.now();
+//   for (const [k, v] of _contentDedup)            // Evict entries older than the window
+//     if (now - v.ts > CONTENT_DEDUP_WINDOW_MS) _contentDedup.delete(k);
+//
+//   let normalizedPayload = payload;
+//   if (payload.startsWith('SOS|')) {
+//     // For SOS: key on source + lat|lon only — ignore accuracy and battery, which can differ
+//     // between two real separate SOS calls from the same person who has moved
+//     const parts = payload.split('|');             // "SOS", lat, lon, accuracy, battery
+//     normalizedPayload = `SOS|${parts[1]??''}|${parts[2]??''}`;
+//   }
+//   const key = `${sourceId}::${normalizedPayload}`;
+//   if (_contentDedup.has(key)) return true;        // Same source + same coordinates = duplicate — drop it
+//   _contentDedup.set(key, { payload, ts: now });
+//   return false;
+// }
+```
+
+Call sites (also commented out) exist at all three ingestion points:
+
+```ts
+// Phone-mesh receive path (useMesh.ts — phoneMesh.setMessageCallback):
+// if (isDuplicateContent(msg.source_id, msg.payload)) return;
+
+// Meshtastic/LoRa receive path (useMesh.ts — getMeshtasticService().setTextMessageCallback):
+// if (isDuplicateContent(msg.source_id, msg.payload)) return;
+
+// GATT/ESP32 relay path (useMesh.ts — handleIncomingGATTMessage):
+// if (isDuplicateContent(msg.source_id, msg.payload)) return;
+```
+
+Why it is off by default: on a noisy multi-hop network a legitimate second message with identical text (e.g. "OK" sent twice) would be silently dropped for 2 minutes. Enable when your deployment topology guarantees dual-delivery on every message.
+
+### 10.4 Meshtastic LoRa channel warm-up beacon (`_sendBeacon`)
+
+First messages after a fresh Meshtastic connect were frequently lost because the remote node had not yet "heard" this sender on the LoRa channel, so the first packet acted as a cold-start frame and was dropped. Fix: immediately after the handshake, `MeshtasticService.connect()` sends an empty `NODEINFO_APP` broadcast which primes the channel without showing up in any peer's chat:
+
+```ts
+// Called at the end of connect(), after the config drain completes
+private async _sendBeacon(): Promise<void> {
+  if (!this.deviceId) return;
+  // PORT_NODEINFO = 4 (NODEINFO_APP) — peers receive and process it silently; it does NOT
+  // appear as a chat message. An empty payload is valid — firmware only needs the portnum.
+  const data    = encodeData(PORT_NODEINFO, new Uint8Array(0));
+  const pktId   = (Math.random() * 0xffffffff) >>> 0;
+  const meshPkt = encodeMeshPacket({
+    to: BROADCAST_ADDR,  // Flood-broadcast so all reachable nodes hear us
+    from: 0,             // Let firmware fill its own node number
+    id: pktId, channel: 0, hopLimit: 3, wantAck: false,
+    decoded: data,
+  });
+  await getBLEService().writeRaw(
+    this.deviceId, MESHTASTIC_SERVICE_UUID, MESHTASTIC_TORADIO_UUID,
+    encodeToRadioPacket(meshPkt),
+  );
+  // 250 ms pause — gives the radio time to actually transmit before the next write (user's first message)
+  await new Promise(r => setTimeout(r, 250));
+}
+```
+
+---
+
+## 11. Storage & Persistence  <!-- section index updated from 10 -->
 
 **File:** `services/storage.service.ts`. Thin wrapper over `AsyncStorage` with five keys:
 ```ts
@@ -1040,9 +1239,21 @@ await writeJSON(KEYS.SEEN_IDS, [...capped, messageId]);
 
 `clearAllMeshData` wipes everything via `multiRemove`.
 
+`clearChatMessages` removes only the chat-specific keys — preserves device identity and the peer node cache:
+```ts
+// Removes mesh:messages, mesh:pending, and mesh:seen_ids.
+// Does NOT touch mesh:device (identity) or mesh:nodes (peer cache) so the user's name
+// and known peers survive a chat history clear.
+export async function clearChatMessages(): Promise<void> {
+  await AsyncStorage.multiRemove([KEYS.MESSAGES, KEYS.PENDING, KEYS.SEEN_IDS]);
+}
+```
+
+This is called by the Settings screen's "Clear Chat History" action before dispatching the Redux `clearMessages()` action. Clearing storage first is critical — if only Redux is cleared, the 10-second `pruneExpiredAsync` / `loadMessagesAsync` cycle immediately reloads the messages from AsyncStorage, making them reappear.
+
 ---
 
-## 11. Notifications
+## 12. Notifications  <!-- section index updated from 11 -->
 
 **File:** `services/notification.service.ts`. Uses `expo-notifications` plus a direct `Vibration.vibrate(300)` to ensure a haptic pulse even when channel vibration is muted.
 
@@ -1094,7 +1305,7 @@ Setup is invoked **after** the splash hides (`app/_layout.tsx`) so the Android 1
 
 ---
 
-## 12. Debug Log Subsystem
+## 13. Debug Log Subsystem  <!-- section index updated from 12 -->
 
 **File:** `services/debug-log.service.ts`. Provides an in-memory rolling 500-entry buffer with subscription support, mirrored to console for `adb logcat`.
 
@@ -1123,9 +1334,9 @@ Consumed by `components/nodes/DebugLogPanel.tsx`, which subscribes via `dlog.sub
 
 ---
 
-## 13. UI — Chat / Nodes / Settings Screens
+## 14. UI — Chat / Nodes / Settings Screens  <!-- section index updated from 13 -->
 
-### 13.1 Chat — `app/(main)/(tabs)/chat/index.tsx`
+### 14.1 Chat — `app/(main)/(tabs)/chat/index.tsx`
 
 A `KeyboardAvoidingView`-wrapped `FlatList` of message bubbles + a sticky `ChatInput`. Sender names are resolved live by looking up the source UUID prefix in `nearbyNodes`:
 ```ts
@@ -1147,15 +1358,15 @@ const handleSend = async (text) => {
 
 Messages are grouped by date with separator rows (Today / Yesterday / formatted date).
 
-### 13.2 MessageBubble — `components/chat/MessageBubble.tsx`
+### 14.2 MessageBubble — `components/chat/MessageBubble.tsx`
 
 Own messages right-aligned (teal `#00c896`), others left-aligned (dark `#1e2535`). Footer shows `time · status · (Mesh) · ↷hops`. The `via === 'meshtastic'` flag adds a `(Mesh)` orange tag.
 
-### 13.3 ChatInput — `components/chat/ChatInput.tsx`
+### 14.3 ChatInput — `components/chat/ChatInput.tsx`
 
 Multiline `TextInput` (max 400 chars) inside a rounded pill, plus a glowing send button that activates only when text is non-empty and not sending.
 
-### 13.4 StatusBanner — `components/chat/StatusBanner.tsx`
+### 14.4 StatusBanner — `components/chat/StatusBanner.tsx`
 
 Animated dot that blinks while scanning. Five states:
 - `connectedCount > 0 && isScanning` — teal "X devices in mesh — broadcasting"
@@ -1164,15 +1375,15 @@ Animated dot that blinks while scanning. Five states:
 - `pendingCount > 0` — orange "Messages queued"
 - otherwise — red "Offline"
 
-### 13.5 Nodes — `app/(main)/(tabs)/nodes/index.tsx`
+### 14.5 Nodes — `app/(main)/(tabs)/nodes/index.tsx`
 
 Three stat boxes (Phones/Meshtastic/Relayed), animated radar (`RadarAnimation`), Start/Stop scan button, `DebugLogPanel`, and a `FlatList` of `NodeCard`s sorted by RSSI.
 
-### 13.6 NodeCard — `components/nodes/NodeCard.tsx`
+### 14.6 NodeCard — `components/nodes/NodeCard.tsx`
 
 For Meshtastic devices it shows a `Connect`/`Disconnect` button; phone peers show an `Auto-Mesh` badge (no GATT needed). RSSI is converted to 5 bars: `bars = round((rssi + 100) / 12)`.
 
-### 13.7 RadarAnimation — `components/nodes/RadarAnimation.tsx`
+### 14.7 RadarAnimation — `components/nodes/RadarAnimation.tsx`
 
 Reanimated-based radar: rotating sweep wedge (2.5 s linear loop), two pulse rings, and a scale pulse. All animations are gated on `isActive`:
 ```ts
@@ -1182,17 +1393,19 @@ rotation.value = withRepeat(withTiming(360, { duration: 2500, easing: Easing.lin
 ring1Opacity.value = withRepeat(withSequence(withTiming(0.6,{duration:1200}), withTiming(0,{duration:1200})), -1, false);
 ```
 
-### 13.8 Settings — `app/(main)/(tabs)/settings/index.tsx`
+### 14.8 Settings — `app/(main)/(tabs)/settings/index.tsx`
 
 Sections:
 - **Identity** — display Device ID, edit Display Name (saves through `useNodeId.updateDisplayName`)
 - **TTL** — preset buttons (5 min → 24 h) + custom (Min/Hr toggle), updates Redux `defaultTtl`
 - **Storage** — counts of total messages and pending queue
-- **Danger Zone** — `clearAllMeshData()` wipes AsyncStorage and dispatches `clearMessages()`
+- **Danger Zone** — two destructive actions, both requiring a two-step confirm:
+  - **Clear Chat History** — calls `clearChatMessages()` (wipes `mesh:messages`, `mesh:pending`, `mesh:seen_ids` from AsyncStorage) then dispatches Redux `clearMessages()`. Both layers must be cleared — clearing only Redux causes messages to reappear when the 10-second sync loop reloads from storage.
+  - **Clear All Mesh Data** — calls `clearAllMeshData()` (wipes all five `mesh:*` keys including identity and nodes) then dispatches `clearMessages()`.
 
 ---
 
-## 14. Mock Layer (Expo Go fallback)
+## 15. Mock Layer (Expo Go fallback)  <!-- section index updated from 14 -->
 
 `services/ble-adapter.ts` and `services/phone-mesh-adapter.ts` swap real implementations for in-memory mocks when running inside Expo Go (no native modules):
 
@@ -1214,7 +1427,7 @@ Every consumer goes through `getBLEService()` / `getPhoneMeshService()` so a cus
 
 ---
 
-## 15. Permissions & Platform Configuration
+## 16. Permissions & Platform Configuration  <!-- section index updated from 15 -->
 
 ### 15.1 `app.config.ts`
 
@@ -1252,7 +1465,9 @@ plugins: [
 
 The `react-native-ble-plx` plugin enables **background** central + peripheral so the app can still receive mesh messages while suspended.
 
-### 15.2 Runtime permission flow
+`expo-location` (for SOS GPS fix) and `expo-battery` (for SOS battery reading) are loaded lazily inside `sendSOS()` — not declared as top-level imports — so a build that omits these modules does not crash at app start.
+
+### 16.2 Runtime permission flow  <!-- section 16 = old 15 -->
 
 `BLEService.requestPermissions()` is invoked from `useBLE`'s init effect; if denied, an `Alert.alert(...)` directs the user to system settings:
 ```ts
@@ -1266,9 +1481,9 @@ if (!granted) {
 
 ---
 
-## 16. Wire Formats
+## 17. Wire Formats  <!-- section index updated from 16 -->
 
-### 16.1 `Message` (in-memory & storage)
+### 17.1 `Message` (in-memory & storage)
 
 ```ts
 interface Message {
@@ -1285,7 +1500,7 @@ interface Message {
 }
 ```
 
-### 16.2 `MessagePacket` (compact JSON over GATT)
+### 17.2 `MessagePacket` (compact JSON over GATT)
 
 Short-keyed for size:
 ```ts
@@ -1295,7 +1510,7 @@ interface MessagePacket { mid; src; dst; sn; pay; ts; ttl; hops; }
 //                  message_id, source_id, destination_id, source_name, payload, timestamp, ttl, hops
 ```
 
-### 16.3 BLE manufacturer-data (phone-mesh)
+### 17.3 BLE manufacturer-data (phone-mesh)
 
 | Offset | Bytes | Field |
 |---|---|---|
@@ -1308,15 +1523,25 @@ interface MessagePacket { mid; src; dst; sn; pay; ts; ttl; hops; }
 | 11 | 1 | hops (≤15) |
 | 12-21 | 10 | payload |
 
-### 16.4 Meshtastic protobuf (subset)
+### 17.4 Meshtastic protobuf (subset)
 
 `ToRadio` field 1 = `MeshPacket` (LEN), field 3 = `want_config_id` (varint).
 `MeshPacket`: from(1)/to(2)/channel(3)/decoded(4)/id(6)/hop_limit(9)/want_ack(10).
-`Data`: portnum(1)/payload(2). `PortNum.TEXT_MESSAGE_APP = 1`.
+`Data`: portnum(1)/payload(2). `PortNum.TEXT_MESSAGE_APP = 1`, `PortNum.NODEINFO_APP = 4` (used by the warm-up beacon).
+
+### 17.5 SOS payload (phone-mesh + Meshtastic)
+
+SOS is transmitted as a plain UTF-8 string in the `payload` field of a `Message` / `MessagePacket`. No protocol extension is needed — receivers call `isSOSPayload(payload)` and branch accordingly:
+
+```
+SOS|<lat>|<lon>|<accuracy_m>|<battery_pct>
+```
+
+This fits within the BLE chunk budget: a 5-decimal-place coordinate pair (`SOS|22.22888|88.44950|15|34`) is 28 bytes — 3 chunks × 10 bytes, well within the 22-chunk budget. Over LoRa/Meshtastic the entire string fits in a single packet.
 
 ---
 
-## 17. Deduplication Strategy (3-Layer)
+## 18. Deduplication Strategy  <!-- section index updated from 17 -->
 
 The system survives the chaotic loops of an ad-hoc mesh by deduplicating at three independent levels:
 
@@ -1325,6 +1550,8 @@ The system survives the chaotic loops of an ad-hoc mesh by deduplicating at thre
 | **L1 — module-level Set** | `_processedMids` in `useMesh.ts` | App process | Permanent, never cleared |
 | **L2 — service-level Set** | `seenMids` in `PhoneMeshService` | App process | Capped at 300, FIFO |
 | **L3 — Redux + AsyncStorage** | `messages.seenIds` + `mesh:seen_ids` | Cross-restart | Capped at 2000, FIFO |
+
+**ID-based dedup limitation with dual transport:** when a message is sent via *both* Meshtastic (LoRa) and phone-mesh BLE simultaneously, the Meshtastic receive path creates a fresh UUID (`message_id: uuidv4()`) for each incoming radio frame, so the same text arrives with two different IDs. Layers L1–L3 (which all key on message ID) cannot catch this. A fourth opt-in layer exists but is commented out by default — see Section 10.3.
 
 In addition, three own-message guards prevent the sender from receiving its own echoes:
 1. **`PhoneMeshService.isOwnSrcId()`** — populated by `setMyIdentity` and by `broadcastMessage`.
@@ -1347,13 +1574,16 @@ state.seenIds = Array.from(expanded);                              // Convert ba
 
 ## Appendix — Lifecycle Walk-Through
 
-1. **App start** → `app/_layout.tsx` preloads fonts/images, hides splash, calls `setupNotifications()`.
+1. **App start** → `app/_layout.tsx` preloads fonts/images in parallel → hides splash as soon as assets are ready → then calls `setupNotifications()` **fire-and-forget** (not awaited). This ordering ensures the Android 13+ `POST_NOTIFICATIONS` runtime permission dialog does not appear *behind* the splash screen on first install.
 2. **Provider tree mounts** → Redux store, gesture handler, theme.
-3. **Tab layout renders** → first useMesh() → `useNodeId` loads UUID from AsyncStorage (or generates one) → Redux `myNodeId` populated.
+3. **Tab layout renders** → first `useMesh()` → `useNodeId` loads UUID from AsyncStorage (or generates one) → Redux `myNodeId` populated.
 4. **`useBLE` init effect** runs: requests Android permissions, waits for BT power on (10 s timeout), sets `isReady`.
 5. **`useMesh` auto-start** sees `isReady && myNodeId && !_autoStarted` → `ble.startScan()`.
 6. **`ble.startScan`** registers `onDeviceFound` listener on `DeviceEventEmitter`, calls `BLEAdvertiser.scan(null, {...})`, kicks off the 5 s watchdog.
 7. **`PhoneMeshService.startPresenceBeacon`** advertises this phone's identity so peers see it.
-8. **Presence beacons / message chunks arriving** → parsed inline → upsert into `nearbyNodes` or fed into `phoneMesh.handleChunk` → reassembled → `onMessageReassembled` callback in `useMesh` → dedup → store → notify → relay (Meshtastic if connected, phone-mesh re-broadcast).
-9. **User types and hits send** → `useMesh.sendMessage` → pre-mark all dedup layers → optimistic local insert → try Meshtastic → fall back to phone-mesh advertisement → fall back to pending queue.
-10. **Every 10 s** → `flushPendingQueue` retries unsent messages over GATT; `pruneExpiredAsync` removes TTL-expired records from storage and Redux.
+8. **Meshtastic node detected** → `useMesh` auto-connect effect fires → `ble.connectToNode` → `MeshtasticService.connect` (want_config → drain NodeDB → `_sendBeacon` NODEINFO warm-up) → session ready; first user message no longer cold-starts the LoRa channel.
+9. **Presence beacons / message chunks arriving** → parsed inline → upsert into `nearbyNodes` or fed into `phoneMesh.handleChunk` → reassembled → `onMessageReassembled` callback in `useMesh` → dedup → store → notify → relay (Meshtastic if connected, phone-mesh re-broadcast).
+10. **User types and hits send** → `useMesh.sendMessage` → pre-mark all dedup layers → optimistic local insert → try Meshtastic (LoRa) → also broadcast on phone-mesh for peers without Meshtastic → fall back to phone-mesh only → fall back to pending queue.
+11. **User taps SOS** → `useMesh.sendSOS` → request location permission → GPS fix (20 s timeout, last-known fallback) → battery level → `encodeSOSPayload` → `sendMessage(payload)` → same dual-transport routing as a normal message.
+12. **Every 10 s** → `flushPendingQueue` retries unsent messages over GATT; `pruneExpiredAsync` removes TTL-expired records from storage and Redux.
+13. **User clears chat** → Settings "Clear Chat History" → `clearChatMessages()` removes `mesh:messages`, `mesh:pending`, `mesh:seen_ids` from AsyncStorage → Redux `clearMessages()` → UI empties immediately and stays empty (storage is clean so the 10-second sync loop has nothing to reload).

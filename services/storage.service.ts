@@ -195,3 +195,8 @@ export async function getSavedNodes(): Promise<MeshNode[]> {
 export async function clearAllMeshData(): Promise<void> {
   await AsyncStorage.multiRemove(Object.values(KEYS));
 }
+
+/** Clear only the chat message history from storage, leaving identity and nodes intact. */
+export async function clearChatMessages(): Promise<void> {
+  await AsyncStorage.multiRemove([KEYS.MESSAGES, KEYS.PENDING, KEYS.SEEN_IDS]);
+}

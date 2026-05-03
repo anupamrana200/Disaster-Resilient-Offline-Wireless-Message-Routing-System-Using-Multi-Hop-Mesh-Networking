@@ -3,7 +3,7 @@
  * Features smooth keyboard-aware animation and a glowing send button.
  */
 
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   View,
   TextInput,
@@ -13,6 +13,7 @@ import {
   ActivityIndicator,
   KeyboardAvoidingView,
   Platform,
+  Animated,
 } from 'react-native';
 
 interface Props {
@@ -33,6 +34,28 @@ export default function ChatInput({ onSend, onSOS, disabled = false }: Props) {
   // Independent loading state for SOS so the chat send button stays responsive
   // while a slow GPS fix is in progress.
   const [sosBusy, setSosBusy] = useState(false);
+
+  // Pulsing glow animation for the SOS button border
+  const pulseAnim = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(pulseAnim, { toValue: 1, duration: 900, useNativeDriver: false }),
+        Animated.timing(pulseAnim, { toValue: 0, duration: 900, useNativeDriver: false }),
+      ]),
+    );
+    loop.start();
+    return () => loop.stop();
+  }, [pulseAnim]);
+
+  const sosBorderColor = pulseAnim.interpolate({
+    inputRange: [0, 1],
+    outputRange: ['#ff453a', '#ff9f9f'],
+  });
+  const sosShadowRadius = pulseAnim.interpolate({
+    inputRange: [0, 1],
+    outputRange: [6, 16],
+  });
 
   const handleSend = async () => {
     const trimmed = text.trim();
@@ -72,20 +95,26 @@ export default function ChatInput({ onSend, onSOS, disabled = false }: Props) {
             screens that don't want this affordance keep their original layout.
             Sits to the left of the input so it doesn't displace the send btn. */}
         {onSOS && (
-          <TouchableOpacity
-            id="chat-sos-button"
-            style={[styles.sosButton, sosBusy && styles.sosButtonBusy]}
-            onPress={handleSOS}
-            disabled={sosBusy || disabled}
-            activeOpacity={0.8}
-            accessibilityLabel="Send SOS with current location">
-            {sosBusy ? (
-              // Spinner — surfaces the GPS-fix delay so the user knows we are working
-              <ActivityIndicator size="small" color="#fff" />
-            ) : (
-              <Text style={styles.sosIcon}>🆘</Text>
-            )}
-          </TouchableOpacity>
+          <Animated.View
+            style={[
+              styles.sosButton,
+              sosBusy && styles.sosButtonBusy,
+              { borderColor: sosBorderColor, shadowRadius: sosShadowRadius },
+            ]}>
+            <TouchableOpacity
+              id="chat-sos-button"
+              style={styles.sosInner}
+              onPress={handleSOS}
+              disabled={sosBusy || disabled}
+              activeOpacity={0.75}
+              accessibilityLabel="Send SOS with current location">
+              {sosBusy ? (
+                <ActivityIndicator size="small" color="#fff" />
+              ) : (
+                <Text style={styles.sosLabel}>SOS</Text>
+              )}
+            </TouchableOpacity>
+          </Animated.View>
         )}
         <View style={styles.inputWrapper}>
           <TextInput
@@ -110,7 +139,10 @@ export default function ChatInput({ onSend, onSOS, disabled = false }: Props) {
           {sending ? (
             <ActivityIndicator size="small" color="#fff" />
           ) : (
-            <Text style={styles.sendIcon}>▲</Text>
+            <View style={styles.sendIconWrapper}>
+              <View style={[styles.sendArrowStem, canSend && styles.sendArrowStemActive]} />
+              <View style={[styles.sendArrowHead, canSend && styles.sendArrowHeadActive]} />
+            </View>
           )}
         </TouchableOpacity>
       </View>
@@ -153,46 +185,80 @@ const styles = StyleSheet.create({
     width: 48,
     height: 48,
     borderRadius: 24,
-    backgroundColor: '#2a3345',
+    backgroundColor: '#1a2133',
     alignItems: 'center',
     justifyContent: 'center',
+    borderWidth: 1.5,
+    borderColor: 'rgba(255,255,255,0.1)',
   },
   sendButtonActive: {
     backgroundColor: '#00c896',
+    borderColor: '#00c896',
     shadowColor: '#00c896',
     shadowOffset: { width: 0, height: 0 },
-    shadowOpacity: 0.5,
-    shadowRadius: 8,
-    elevation: 6,
+    shadowOpacity: 0.7,
+    shadowRadius: 10,
+    elevation: 8,
   },
-  // ─── SOS button ───────────────────────────────────────────────────────────
-  // Distinct red colour to signal danger and avoid accidental taps. Same 48x48
-  // size as the send button for layout symmetry.
-  sosButton: {
-    width: 48,
-    height: 48,
-    borderRadius: 24,
-    backgroundColor: '#ff453a', // System destructive red
+  sendIconWrapper: {
     alignItems: 'center',
     justifyContent: 'center',
-    borderWidth: 1,
-    borderColor: '#ff6961',
+    width: 20,
+    height: 20,
+  },
+  sendArrowStem: {
+    width: 2,
+    height: 9,
+    borderRadius: 1,
+    backgroundColor: 'rgba(255,255,255,0.3)',
+    marginBottom: 1,
+  },
+  sendArrowStemActive: {
+    backgroundColor: '#fff',
+  },
+  sendArrowHead: {
+    width: 0,
+    height: 0,
+    borderLeftWidth: 5,
+    borderRightWidth: 5,
+    borderBottomWidth: 8,
+    borderLeftColor: 'transparent',
+    borderRightColor: 'transparent',
+    borderBottomColor: 'rgba(255,255,255,0.3)',
+    position: 'absolute',
+    top: 0,
+  },
+  sendArrowHeadActive: {
+    borderBottomColor: '#fff',
+  },
+  // ─── SOS button ───────────────────────────────────────────────────────────
+  // Circle with deep red fill, pulsing border glow, and bold white SOS text.
+  // Deliberately larger than the send button (52px) to signal importance.
+  sosButton: {
+    width: 52,
+    height: 52,
+    borderRadius: 26,
+    backgroundColor: '#c0392b',
+    borderWidth: 2.5,
     shadowColor: '#ff453a',
     shadowOffset: { width: 0, height: 0 },
-    shadowOpacity: 0.5,
-    shadowRadius: 8,
-    elevation: 6,
+    shadowOpacity: 1,
+    elevation: 10,
+    overflow: 'hidden',
   },
-  // Faded look while a GPS fix is in flight — communicates "we're working on it"
+  sosInner: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  sosLabel: {
+    fontSize: 14,
+    fontWeight: '900',
+    color: '#ffffff',
+    fontFamily: 'OpenSans-Bold',
+    letterSpacing: 1.5,
+  },
   sosButtonBusy: {
-    opacity: 0.6,
-  },
-  sosIcon: {
-    fontSize: 22,
-  },
-  sendIcon: {
-    color: '#fff',
-    fontSize: 18,
-    fontWeight: '700',
+    opacity: 0.55,
   },
 });

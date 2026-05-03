@@ -31,6 +31,56 @@ import { encodeSOSPayload } from '@/services/sos.service';
 
 const MAX_HOPS = 5;
 
+// ─── Content-based dedup cache (commented out — uncomment to enable) ──────────
+//
+// Problem this solves:
+//   When a message is broadcast via BOTH Meshtastic (LoRa) and phone-mesh (BLE)
+//   simultaneously, the receiving device sees it twice — once from each transport.
+//   The existing ID-based dedup (_processedMids) only catches exact message_id
+//   repeats. But the Meshtastic path assigns a fresh UUID (message_id: uuidv4())
+//   on receive, so the same text arrives with two different IDs.
+//
+// Strategy:
+//   Build a key from (source_id + normalized_payload) and record the timestamp.
+//   If the same key arrives again within CONTENT_DEDUP_WINDOW_MS, drop it.
+//   For SOS messages, the key uses only the lat|lon fields (ignoring accuracy and
+//   battery which can legitimately differ between two real separate SOS calls).
+//
+// Why it is off by default:
+//   On a noisy multi-hop network a legitimate second message with identical text
+//   (e.g. "OK" sent twice) would be silently dropped for 2 minutes. Enable only
+//   when your deployment topology consistently delivers every message on both
+//   transports simultaneously.
+//
+// const CONTENT_DEDUP_WINDOW_MS = 2 * 60 * 1000; // 2 minutes
+//
+// interface ContentDedupEntry { payload: string; ts: number; }
+// const _contentDedup = new Map<string, ContentDedupEntry>(); // key → last-seen
+//
+// /**
+//  * Returns true (and should be dropped) if an identical message from the same
+//  * source was already processed within CONTENT_DEDUP_WINDOW_MS.
+//  * Evicts stale entries on every call to keep memory bounded.
+//  */
+// function isDuplicateContent(sourceId: string, payload: string): boolean {
+//   const now = Date.now();
+//   // Evict entries older than the window
+//   for (const [k, v] of _contentDedup) {
+//     if (now - v.ts > CONTENT_DEDUP_WINDOW_MS) _contentDedup.delete(k);
+//   }
+//   // For SOS: key on source + exact lat|lon only (fields 1 and 2 after "SOS|")
+//   let normalizedPayload = payload;
+//   if (payload.startsWith('SOS|')) {
+//     const parts = payload.split('|');
+//     // parts[0]="SOS", parts[1]=lat, parts[2]=lon — ignore accuracy and battery
+//     normalizedPayload = `SOS|${parts[1] ?? ''}|${parts[2] ?? ''}`;
+//   }
+//   const key = `${sourceId}::${normalizedPayload}`;
+//   if (_contentDedup.has(key)) return true; // duplicate — drop it
+//   _contentDedup.set(key, { payload, ts: now });
+//   return false;
+// }
+
 /**
  * Module-level permanent dedup set.
  *
@@ -263,6 +313,17 @@ export function useMesh(): UseMeshResult {
         hops: (raw.hops ?? 0) + 1,
       };
 
+      // ── Content-based dedup (phone-mesh path) — uncomment to enable ──────────
+      // Drops a message if the same source sent identical content (or identical
+      // SOS coordinates) within the last 2 minutes. Prevents the receiver from
+      // seeing a message twice when it arrives on both BLE and LoRa transports.
+      //
+      // if (isDuplicateContent(msg.source_id, msg.payload)) {
+      //   console.log(`[Mesh] Content-dedup: dropping duplicate from ${sourceName}`);
+      //   return;
+      // }
+      // ─────────────────────────────────────────────────────────────────────────
+
       if (!isExpired(msg) && msg.hops <= MAX_HOPS) {
         msgsSlice.dispatch(msgsSlice.addMessageAsync(msg));
         showMessageNotification(sourceName, msg.payload).catch(() => {});
@@ -361,6 +422,18 @@ export function useMesh(): UseMeshResult {
         hops: 1,
         via: 'meshtastic',
       };
+
+      // ── Content-based dedup (Meshtastic/LoRa path) — uncomment to enable ─────
+      // Drops this LoRa message if the same node already delivered identical
+      // content (or identical SOS coordinates) via phone-mesh BLE within 2 min.
+      // This is the primary site for the dual-transport duplicate problem because
+      // the Meshtastic path always generates a fresh UUID, bypassing ID-based dedup.
+      //
+      // if (isDuplicateContent(msg.source_id, msg.payload)) {
+      //   console.log(`[Mesh] Content-dedup: dropping LoRa duplicate from ${incoming.fromName}`);
+      //   return;
+      // }
+      // ─────────────────────────────────────────────────────────────────────────
 
       msgsSlice.dispatch(msgsSlice.addMessageAsync(msg));
       showMessageNotification(incoming.fromName, incoming.text).catch(() => {});
@@ -689,6 +762,13 @@ export function useMesh(): UseMeshResult {
 
         const msg = packetToMessage(packet);
         if (isExpired(msg) || msg.hops > MAX_HOPS) return;
+
+        // ── Content-based dedup (GATT/ESP32 path) — uncomment to enable ────────
+        // if (isDuplicateContent(msg.source_id, msg.payload)) {
+        //   console.log(`[Mesh] Content-dedup: dropping GATT duplicate from ${msg.source_name}`);
+        //   return;
+        // }
+        // ───────────────────────────────────────────────────────────────────────
 
         await msgsSlice.dispatch(msgsSlice.addMessageAsync(msg));
         // Notify user — single vibration + notification panel entry

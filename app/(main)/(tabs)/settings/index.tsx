@@ -17,7 +17,7 @@ import { LinearGradient } from 'expo-linear-gradient';
 import { useNodeId } from '@/hooks/useNodeId';
 import { useNodesSlice } from '@/slices/nodes.slice';
 import { useMessagesSlice } from '@/slices/messages.slice';
-import { clearAllMeshData } from '@/services/storage.service';
+import { clearAllMeshData, clearChatMessages } from '@/services/storage.service';
 
 const TTL_OPTIONS = [
   { label: '5 Min', value: 300 },
@@ -45,6 +45,7 @@ export default function SettingsScreen() {
   const [isSaving, setIsSaving] = useState(false);
   const [toast, setToast] = useState<Toast | null>(null);
   const [confirmClear, setConfirmClear] = useState(false);
+  const [confirmClearChat, setConfirmClearChat] = useState(false);
   const [customTtlValue, setCustomTtlValue] = useState('');
   const [customTtlUnit, setCustomTtlUnit] = useState<'minutes' | 'hours'>('minutes');
 
@@ -92,6 +93,13 @@ export default function SettingsScreen() {
     msgsDispatch(clearMessages());
     setConfirmClear(false);
     showToast('All mesh data cleared', 'info');
+  };
+
+  const handleClearChat = async () => {
+    await clearChatMessages();       // wipe AsyncStorage first
+    msgsDispatch(clearMessages());   // then clear Redux so UI updates immediately
+    setConfirmClearChat(false);
+    showToast('Chat history cleared', 'info');
   };
 
   const handleSetCustomTtl = () => {
@@ -242,6 +250,40 @@ export default function SettingsScreen() {
 
           {/* Danger Zone */}
           <Section title="Danger Zone">
+            {/* Clear Chat History */}
+            {confirmClearChat ? (
+              <View style={styles.confirmCard}>
+                <Text style={styles.confirmTitle}>Clear chat history?</Text>
+                <Text style={styles.confirmDesc}>
+                  Removes all messages from the chat screen. Peer and node data is kept.
+                </Text>
+                <View style={styles.confirmButtons}>
+                  <TouchableOpacity
+                    style={styles.confirmCancel}
+                    onPress={() => setConfirmClearChat(false)}
+                  >
+                    <Text style={styles.confirmCancelText}>Cancel</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={styles.confirmDelete}
+                    onPress={handleClearChat}
+                  >
+                    <Text style={styles.confirmDeleteText}>Clear</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            ) : (
+              <TouchableOpacity
+                id="settings-clear-chat"
+                style={styles.dangerButton}
+                onPress={() => setConfirmClearChat(true)}
+                activeOpacity={0.8}
+              >
+                <Text style={styles.dangerButtonText}>Clear Chat History</Text>
+              </TouchableOpacity>
+            )}
+
+            {/* Clear All Mesh Data */}
             {confirmClear ? (
               <View style={styles.confirmCard}>
                 <Text style={styles.confirmTitle}>Delete all messages?</Text>
