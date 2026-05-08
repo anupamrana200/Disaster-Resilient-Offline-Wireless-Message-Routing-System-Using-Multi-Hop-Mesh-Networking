@@ -14,7 +14,16 @@
       "Bash(npm run dev:deploy:web:*)",
       "Bash(npm test:*)",
       "Bash(npx expo-doctor:*)",
-      "Bash(npm install:*)"
+      "Bash(npm install:*)",
+      "Bash(git push *)",
+      "Bash(gh api *)",
+      "Bash(eas whoami *)",
+      "Bash(cmd /c \"gradlew.bat assembleRelease\")",
+      "Bash(gradlew.bat assembleRelease)",
+      "Bash(cmd.exe /c \"gradlew.bat assembleRelease\")",
+      "Bash(java --version)",
+      "Bash(./gradlew assembleRelease)",
+      "Bash(node -e ' *)"
     ],
     "deny": []
   }
