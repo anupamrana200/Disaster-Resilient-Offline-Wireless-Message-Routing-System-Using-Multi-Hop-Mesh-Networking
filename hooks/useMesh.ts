@@ -47,6 +47,13 @@ const MAX_HOPS = 5;
 // For SOS: key on "SOS|lat|lon" only — strips accuracy + battery which can
 // legitimately differ between two real separate distress calls.
 
+// Separator used to embed the sender's display name inside the LoRa payload.
+// \x01 (ASCII SOH) is never produced by a keyboard so it won't appear in real text.
+// Wire format: "\x01<displayName>\x01<actualPayload>"
+// Receivers that understand this prefix extract the name; legacy nodes see the
+// full string as the message text (graceful degradation).
+const MESH_NAME_SEP = '\x01';
+
 const CONTENT_DEDUP_WINDOW_MS = 2 * 60 * 1000; // 2 minutes
 
 interface ContentDedupEntry { ts: number; }
@@ -392,12 +399,26 @@ export function useMesh(): UseMeshResult {
       _processedMids.add(dedupKey);
       msgsSlice.dispatch(msgsSlice.addSeenId(dedupKey));
 
+      // Extract embedded display name if present (format: \x01<name>\x01<payload>).
+      // Falls back to Meshtastic's fromName (may be "!hex") if not embedded.
+      let resolvedName = incoming.fromName;
+      let resolvedText = incoming.text;
+      if (incoming.text.startsWith(MESH_NAME_SEP)) {
+        const secondSep = incoming.text.indexOf(MESH_NAME_SEP, 1);
+        if (secondSep !== -1) {
+          resolvedName = incoming.text.slice(1, secondSep);
+          resolvedText = incoming.text.slice(secondSep + 1);
+        }
+      }
+      // Append "(mesh)" so the receiver knows this came via LoRa
+      const displayName = `${resolvedName} (mesh)`;
+
       const msg: Message = {
         message_id: uuidv4(), // fresh UUID so Redux/storage never collides
         source_id: `meshtastic-${incoming.fromNodeNum.toString(16)}`,
         destination_id: '*',
-        source_name: incoming.fromName,
-        payload: incoming.text,
+        source_name: displayName,
+        payload: resolvedText,
         timestamp: incoming.rxTime ? incoming.rxTime * 1000 : Date.now(),
         ttl: 86400,
         status: 'relayed',
@@ -405,16 +426,17 @@ export function useMesh(): UseMeshResult {
         via: 'meshtastic',
       };
 
-      // Cross-transport dedup: if this exact text from this sender already arrived
-      // via BLE within 2 min, drop the LoRa copy (or vice-versa).
-      if (isDuplicateContent(incoming.fromName, msg.payload)) {
-        console.log(`[Mesh] Content-dedup: dropping LoRa duplicate from ${incoming.fromName}`);
+      // Cross-transport dedup: if this exact text already arrived via BLE within
+      // 2 min, drop the LoRa copy. Use resolvedText (name stripped) so the key
+      // matches the BLE path which carries raw payload without the \x01 prefix.
+      if (isDuplicateContent(resolvedName, resolvedText)) {
+        console.log(`[Mesh] Content-dedup: dropping LoRa duplicate from ${resolvedName}`);
         return;
       }
 
       msgsSlice.dispatch(msgsSlice.addMessageAsync(msg));
-      showMessageNotification(incoming.fromName, incoming.text).catch(() => {});
-      console.log(`[Mesh] Meshtastic message from ${incoming.fromName}: "${incoming.text}"`);
+      showMessageNotification(displayName, resolvedText).catch(() => {});
+      console.log(`[Mesh] Meshtastic message from ${displayName}: "${resolvedText}"`);
     });
   }, [nodesSlice.myNodeId, nodesSlice.myDisplayName, ble.isReady]);
 
@@ -529,7 +551,10 @@ export function useMesh(): UseMeshResult {
         } else {
           dlog.info('Mesh', `Meshtastic session already active`);
         }
-        const sentViaMeshtastic = await mt.sendText(msg.payload, 0);
+        // Embed display name in payload so the receiver can show the real name
+        // instead of the Meshtastic node's "!hex" fallback.
+        const loraPayload = `${MESH_NAME_SEP}${nodesSlice.myDisplayName}${MESH_NAME_SEP}${msg.payload}`;
+        const sentViaMeshtastic = await mt.sendText(loraPayload, 0);
         if (sentViaMeshtastic) {
           broadcastOk = true;
           await msgsSlice.dispatch(
@@ -554,7 +579,8 @@ export function useMesh(): UseMeshResult {
         dlog.info('Mesh', `auto-connect result: ${connected}`);
         if (connected) {
           await mt.connect(nearest.node_id);
-          const sentViaMeshtastic = await mt.sendText(msg.payload, 0);
+          const loraPayload2 = `${MESH_NAME_SEP}${nodesSlice.myDisplayName}${MESH_NAME_SEP}${msg.payload}`;
+          const sentViaMeshtastic = await mt.sendText(loraPayload2, 0);
           if (sentViaMeshtastic) {
             broadcastOk = true;
             await msgsSlice.dispatch(
